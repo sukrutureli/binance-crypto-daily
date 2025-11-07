@@ -3,20 +3,20 @@ import time
 import requests
 import pandas as pd
 from ta.trend import EMAIndicator, ADXIndicator, MACD
-from ta.momentum import RSIIndicator
+from ta.momentum import RSIIndicator, ROCIndicator
 from ta.volatility import AverageTrueRange
+from ta.volume import ChaikinMoneyFlowIndicator
 
 BINANCE_SPOT_BASE = "https://binance-proxy-63js.onrender.com/api"
 
 # === 1️⃣ Sembol Listesi ===
-def get_spot_symbols(max_retries: int = 5, delay: float = 5.0):
+def get_spot_symbols(max_retries=5, delay=5.0):
     url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(url, timeout=15)
-            data = resp.json()
-            if not isinstance(data, dict) or "symbols" not in data:
-                print(f"⚠️ [{attempt}] Yanıt beklenmedik: {data}")
+            data = requests.get(url, timeout=15).json()
+            if "symbols" not in data:
+                print(f"⚠️ Yanıt hatalı, {attempt}. deneme: {data}")
                 time.sleep(delay)
                 continue
             symbols = [
@@ -26,14 +26,11 @@ def get_spot_symbols(max_retries: int = 5, delay: float = 5.0):
                 and s.get("quoteAsset") == "USDT"
                 and s.get("isSpotTradingAllowed", False)
             ]
-            if symbols:
-                print(f"✅ {len(symbols)} spot sembol bulundu.")
-                return symbols
-            time.sleep(delay)
+            print(f"✅ {len(symbols)} spot sembol bulundu.")
+            return symbols
         except Exception as e:
             print(f"⚠️ [{attempt}] Hata: {e}")
             time.sleep(delay)
-    print("❌ Sembol listesi alınamadı.")
     return []
 
 # === 2️⃣ Kline Verisi ===
@@ -45,7 +42,8 @@ def get_klines(symbol, interval="1d", limit=120):
         if isinstance(data, dict): return None
         df = pd.DataFrame(data, columns=[
             "open_time","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_base_volume","taker_quote_volume","ignore"
+            "close_time","quote_volume","trades",
+            "taker_base_volume","taker_quote_volume","ignore"
         ])
         for c in ["open","high","low","close","volume"]:
             df[c] = df[c].astype(float)
@@ -68,17 +66,19 @@ def compute_indicators(df):
     df["macd_hist"] = macd.macd_diff()
     df["vol_sma20"] = df["volume"].rolling(20).mean()
     df["atr14"] = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
+    # Yeni göstergeler:
+    df["cmf"] = ChaikinMoneyFlowIndicator(df["high"], df["low"], df["close"], df["volume"], 20).chaikin_money_flow()
+    df["roc"] = ROCIndicator(df["close"], 9).roc()
     return df
 
-# === 4️⃣ Günlük ve Haftalık Filtreler (ESNETİLMİŞ) ===
+# === 4️⃣ Filtreler ===
 def daily_long_condition(last):
-    # Daha gevşek RSI / ADX / MACD koşulları
-    if any(pd.isna(last.get(k)) for k in ["ema9","ema21","ema50","rsi","adx","macd_line","macd_signal"]):
+    if any(pd.isna(last.get(k)) for k in ["ema9","ema21","rsi","adx","macd_line","macd_signal"]):
         return False
     return (
         last["ema9"] > last["ema21"]
-        and last["rsi"] > 40   # eskiden 45’ti
-        and last["adx"] > 15   # eskiden 20’ydi
+        and last["rsi"] > 40
+        and last["adx"] > 15
         and last["macd_line"] > last["macd_signal"]
         and last["volume"] > (last["vol_sma20"] or 0)
     )
@@ -88,60 +88,81 @@ def weekly_long_condition(last):
         return False
     return (
         last["ema9"] > last["ema21"]
-        and last["rsi"] > 48   # biraz gevşetildi
-        and last["adx"] > 18   # biraz gevşetildi
+        and last["rsi"] > 48
+        and last["adx"] > 18
         and last["macd_line"] > last["macd_signal"]
     )
 
-# === 5️⃣ Entry / Stop / Target ===
-def calc_entry_stop_target(last_row, kind):
-    price = last_row["close"]
-    atr = last_row.get("atr14")
+# === 5️⃣ Giriş / Stop / Hedef ===
+def calc_entry_stop_target(last, kind):
+    price = last["close"]
+    atr = last.get("atr14")
     if pd.isna(atr) or atr <= 0:
         return None, None, None
     if kind == "daily":
-        entry = price
-        stop = price - 1.2 * atr   # biraz daha yakın stop
-        target = price + 2.0 * atr # daha ulaşılabilir hedef
+        return price, price - 1.2 * atr, price + 2.0 * atr
     else:
-        entry = price
-        stop = price - 1.7 * atr   # eskiden 2.0
-        target = price + 3.2 * atr # eskiden 4.0
-    return entry, stop, target
+        return price, price - 1.7 * atr, price + 3.2 * atr
 
-# === 6️⃣ HTML Rapor ===
+# === 6️⃣ Hacim & Momentum Analizi ===
+def compute_strength(last):
+    """0–100 arası sinyal gücü skoru"""
+    score = 0
+    vol_ratio = (last["volume"] / (last["vol_sma20"] or 1))
+    cmf = last.get("cmf", 0)
+    roc = last.get("roc", 0)
+
+    # Trend
+    if last["ema9"] > last["ema21"]: score += 20
+    if last["rsi"] > 45: score += 10
+    if last["adx"] > 20: score += 10
+    if last["macd_line"] > last["macd_signal"]: score += 10
+
+    # Hacim / Para Akışı
+    if vol_ratio > 1.3: score += 15
+    if cmf > 0.05: score += 15
+
+    # Momentum
+    if roc > 0: score += 10
+
+    score = min(100, max(0, score))
+    return score, vol_ratio, cmf, roc
+
+# === 7️⃣ HTML ===
 def generate_html_report(rows, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     h = [
         "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>",
-        "<title>Binance Spot Günlük & Haftalık Sinyaller</title>",
+        "<title>Binance Spot Daily & Weekly Strength Report</title>",
         "<style>body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px;}"
         "table{width:100%;border-collapse:collapse;margin-top:15px;}th,td{padding:6px;font-size:11px;text-align:right;}"
         "th{background:#111827;}tr:nth-child(even){background:#0f172a;}tr:nth-child(odd){background:#1e293b;}"
         ".sym{text-align:left;font-weight:bold;}.yes{color:#22c55e;font-weight:bold;}.no{color:#9ca3af;}</style></head><body>",
-        "<h1 style='text-align:center;color:#a855f7'>Binance Spot Daily & Weekly Filter (USDT)</h1>",
-        "<p style='text-align:center;font-size:11px;color:#9ca3af'>Günlük (kısa vadeli) ve haftalık (swing) giriş/stop/hedef değerleri</p>",
+        "<h1 style='text-align:center;color:#a855f7'>Binance Spot Günlük & Haftalık Analiz</h1>",
+        "<p style='text-align:center;font-size:11px;color:#9ca3af'>Hacim, para akışı ve momentumla güçlendirilmiş sinyal tablosu</p>",
         "<table><tr><th style='text-align:left'>Symbol</th><th>Last</th>"
         "<th>Daily</th><th>D Entry</th><th>D Stop</th><th>D Target</th>"
         "<th>Weekly</th><th>W Entry</th><th>W Stop</th><th>W Target</th>"
-        "<th>RSI (D)</th><th>RSI (W)</th><th>ADX (D)</th><th>ADX (W)</th></tr>"
+        "<th>Vol xAvg</th><th>CMF</th><th>ROC%</th><th>Score</th></tr>"
     ]
     for r in rows:
-        d = "yes" if r["daily_long"] else "no"
-        w = "yes" if r["weekly_long"] else "no"
-        fmt = lambda x, d=4: f"{x:.{d}f}" if x else "-"
+        fmt = lambda x, d=4: f"{x:.{d}f}" if x is not None else "-"
+        dcls = "yes" if r["daily_long"] else "no"
+        wcls = "yes" if r["weekly_long"] else "no"
         h.append(
             f"<tr><td class='sym'>{r['symbol']}</td><td>{fmt(r['last_price'])}</td>"
-            f"<td class='{d}'>{'BUY' if r['daily_long'] else '-'}</td>"
+            f"<td class='{dcls}'>{'BUY' if r['daily_long'] else '-'}</td>"
             f"<td>{fmt(r['entry_d'])}</td><td>{fmt(r['stop_d'])}</td><td>{fmt(r['target_d'])}</td>"
-            f"<td class='{w}'>{'BUY' if r['weekly_long'] else '-'}</td>"
+            f"<td class='{wcls}'>{'BUY' if r['weekly_long'] else '-'}</td>"
             f"<td>{fmt(r['entry_w'])}</td><td>{fmt(r['stop_w'])}</td><td>{fmt(r['target_w'])}</td>"
-            f"<td>{fmt(r['rsi_d'],2)}</td><td>{fmt(r['rsi_w'],2)}</td><td>{fmt(r['adx_d'],2)}</td><td>{fmt(r['adx_w'],2)}</td></tr>"
+            f"<td>{fmt(r['vol_ratio'],2)}</td><td>{fmt(r['cmf'],3)}</td>"
+            f"<td>{fmt(r['roc'],2)}</td><td>{r['strength']}</td></tr>"
         )
     h.append("</table></body></html>")
-    open(output_path, "w", encoding="utf-8").write("\n".join(h))
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(h))
 
-# === 7️⃣ Ana Akış ===
+# === 8️⃣ Ana Akış ===
 def main():
     print("▶ Spot semboller alınıyor...")
     symbols = get_spot_symbols()
@@ -154,30 +175,33 @@ def main():
             df_w = get_klines(sym, "1w", 120)
             if df_d is None or len(df_d) < 60 or df_w is None or len(df_w) < 60:
                 continue
+
             df_d, df_w = compute_indicators(df_d), compute_indicators(df_w)
             last_d, last_w = df_d.iloc[-1], df_w.iloc[-1]
+
             daily_long = daily_long_condition(last_d)
             weekly_long = weekly_long_condition(last_w)
+
             entry_d, stop_d, target_d = (calc_entry_stop_target(last_d, "daily") if daily_long else (None, None, None))
             entry_w, stop_w, target_w = (calc_entry_stop_target(last_w, "weekly") if weekly_long else (None, None, None))
+
+            strength, vol_ratio, cmf, roc = compute_strength(last_d)
+
             rows.append({
                 "symbol": sym,
                 "last_price": last_d["close"],
                 "daily_long": daily_long, "weekly_long": weekly_long,
                 "entry_d": entry_d, "stop_d": stop_d, "target_d": target_d,
                 "entry_w": entry_w, "stop_w": stop_w, "target_w": target_w,
-                "rsi_d": last_d["rsi"], "rsi_w": last_w["rsi"],
-                "adx_d": last_d["adx"], "adx_w": last_w["adx"]
+                "vol_ratio": vol_ratio, "cmf": cmf, "roc": roc,
+                "strength": strength
             })
             time.sleep(0.07)
         except Exception as e:
             print(f"⚠️ {sym} hata: {e}")
             continue
-    rows_sorted = sorted(rows, key=lambda r: (
-        0 if (r["daily_long"] and r["weekly_long"]) else
-        1 if (r["daily_long"] or r["weekly_long"]) else 2,
-        -r["rsi_d"]
-    ))
+
+    rows_sorted = sorted(rows, key=lambda r: (-r["strength"], -r["vol_ratio"]))
     out = "public/spot.html"
     generate_html_report(rows_sorted, out)
     print(f"✅ Spot raporu üretildi: {out}")
