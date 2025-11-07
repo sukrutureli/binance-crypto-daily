@@ -32,7 +32,7 @@ jobs:
       - name: Wake up Render Proxy
         run: |
           echo "🔄 Proxy uyanıyor..."
-          curl -s https://binance-proxy-29n9.onrender.com/fapi/v1/exchangeInfo > /dev/null || true
+          curl -s https://binance-proxy-63js.onrender.com/fapi/v1/exchangeInfo > /dev/null || true
           echo "✅ Proxy hazır."
 
       - name: Build Futures report
@@ -42,7 +42,7 @@ jobs:
       - name: Wake up Render Proxy
         run: |
           echo "🔄 Proxy uyanıyor (SPOT)..."
-          curl -s https://binance-proxy-29n9.onrender.com/api/v3/exchangeInfo > /dev/null || true
+          curl -s https://binance-proxy-63js.onrender.com/api/v3/exchangeInfo > /dev/null || true
           echo "✅ Proxy hazır."
 
       - name: Build Spot report
