@@ -29,15 +29,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Wake up Render Proxy
-        run: |
-          echo "🔄 Proxy uyanıyor..."
-          curl -s https://binance-proxy-63js.onrender.com/fapi/v1/exchangeInfo > /dev/null || true
-          echo "✅ Proxy hazır."
-
-      - name: Build Futures report
-        run: |
-          python main_futures.py
+#      - name: Wake up Render Proxy
+#        run: |
+#          echo "🔄 Proxy uyanıyor..."
+#          curl -s https://binance-proxy-63js.onrender.com/fapi/v1/exchangeInfo > /dev/null || true
+#          echo "✅ Proxy hazır."
+#
+#      - name: Build Futures report
+#        run: |
+#          python main_futures.py
 
       - name: Wake up Render Proxy
         run: |
