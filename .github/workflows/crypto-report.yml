@@ -28,7 +28,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
+
       - name: Wake up Render Proxy
         run: |
           echo "🔄 Proxy uyanıyor..."
@@ -38,6 +38,12 @@ jobs:
       - name: Build Futures report
         run: |
           python main_futures.py
+
+      - name: Wake up Render Proxy
+        run: |
+          echo "🔄 Proxy uyanıyor (SPOT)..."
+          curl -s https://binance-proxy-29n9.onrender.com/api/v3/exchangeInfo > /dev/null || true
+          echo "✅ Proxy hazır."
 
       - name: Build Spot report
         run: |
