@@ -3,8 +3,8 @@ name: Crypto Daily Reports
 on:
   workflow_dispatch:
   schedule:
-    # Her gün 21:00 UTC (Türkiye saati 00:00)
-    - cron: '0 21 * * *'
+    # Her gün 07:00 UTC (Türkiye saati 10:00)
+    - cron: '0 7 * * *'
 
 permissions:
   contents: read
