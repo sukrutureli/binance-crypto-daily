@@ -7,7 +7,7 @@ from ta.trend import EMAIndicator, ADXIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-BINANCE_FAPI_BASE = "https://fapi.binance.com"
+BINANCE_FAPI_BASE = "https://binance-proxy-29n9.onrender.com/fapi"
 
 # === 1️⃣ Binance Sembolleri Güvenli Çekme ===
 def get_futures_symbols(max_retries: int = 5, delay: float = 5.0):

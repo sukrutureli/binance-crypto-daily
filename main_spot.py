@@ -6,7 +6,7 @@ import pandas as pd
 from ta.trend import EMAIndicator, ADXIndicator, MACD
 from ta.momentum import RSIIndicator
 
-BINANCE_SPOT_BASE = "https://api.binance.com"
+BINANCE_SPOT_BASE = "https://binance-proxy-29n9.onrender.com/api"
 
 # === 1️⃣ Güvenli Sembol Çekme ===
 def get_spot_symbols(max_retries: int = 5, delay: float = 5.0):
