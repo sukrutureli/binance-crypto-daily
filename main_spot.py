@@ -70,26 +70,28 @@ def compute_indicators(df):
     df["roc"] = ROCIndicator(df["close"], 9).roc()
     return df
 
-# === 4️⃣ Filtreler ===
+# === 4️⃣ Filtreler (Soft Mode) ===
 def daily_long_condition(last):
-    """Sadeleştirilmiş ve seçici günlük koşullar"""
+    """Günlük sinyali biraz gevşetilmiş filtre."""
     if any(pd.isna(last.get(k)) for k in ["ema9","ema21","ema50","rsi","adx","macd_line","macd_signal","vol_sma20"]):
         return False
     return (
-        last["ema9"] > last["ema21"] > last["ema50"]
-        and 45 < last["rsi"] < 65
-        and last["adx"] > 20
+        # Trend yapısı: 9 > 21 > 50 şartı kaldırıldı, yerine 9 > 21 ve yakınlık kontrolü
+        last["ema9"] > last["ema21"] * 0.995
+        and last["rsi"] > 42 and last["rsi"] < 68
+        and last["adx"] > 15
         and last["macd_line"] > last["macd_signal"]
-        and last["volume"] > 1.1 * (last["vol_sma20"] or 1)
+        and last["volume"] > 0.9 * (last["vol_sma20"] or 1)
+        and last.get("cmf", 0) > -0.05  # para akışı çok negatif olmasın
     )
 
 def weekly_long_condition(last):
-    """Haftalık trend onayı"""
+    """Haftalık trend onayı (değişmedi)."""
     if any(pd.isna(last.get(k)) for k in ["ema9","ema21","rsi","adx","macd_line","macd_signal"]):
         return False
     return (
         last["ema9"] > last["ema21"]
-        and last["rsi"] > 50
+        and last["rsi"] > 48
         and last["adx"] > 18
         and last["macd_line"] > last["macd_signal"]
     )
@@ -101,25 +103,25 @@ def calc_entry_stop_target(last, kind):
     if pd.isna(atr) or atr <= 0:
         return None, None, None
     if kind == "daily":
-        return price, price - 1.3 * atr, price + 2.0 * atr
+        return price, price - 1.2 * atr, price + 1.8 * atr
     else:
         return price, price - 1.8 * atr, price + 3.0 * atr
 
-# === 6️⃣ HTML Rapor ===
+# === 6️⃣ HTML ===
 def generate_html_report(rows, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     h = [
         "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>",
-        "<title>Binance Spot Günlük & Haftalık Analiz</title>",
+        "<title>Binance Spot Günlük & Haftalık Analiz (Soft Mode)</title>",
         "<style>body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px;}table{width:100%;border-collapse:collapse;margin-top:15px;}"
         "th,td{padding:6px;font-size:11px;text-align:right;}th{background:#111827;}tr:nth-child(even){background:#0f172a;}tr:nth-child(odd){background:#1e293b;}"
         ".sym{text-align:left;font-weight:bold;}.yes{color:#22c55e;font-weight:bold;}.no{color:#9ca3af;}</style></head><body>",
         "<h1 style='text-align:center;color:#a855f7'>Binance Spot Günlük & Haftalık Analiz</h1>",
-        "<p style='text-align:center;font-size:11px;color:#9ca3af'>Yalnızca güçlü trend ve hacim onayı olan sinyaller</p>",
+        "<p style='text-align:center;font-size:11px;color:#9ca3af'>Soft mode: potansiyel trend başlangıçlarını da dahil eder</p>",
         "<table><tr><th style='text-align:left'>Symbol</th><th>Last</th>"
         "<th>Daily</th><th>D Entry</th><th>D Stop</th><th>D Target</th>"
         "<th>Weekly</th><th>W Entry</th><th>W Stop</th><th>W Target</th>"
-        "<th>RSI</th><th>ADX</th><th>Vol xAvg</th></tr>"
+        "<th>RSI</th><th>ADX</th><th>Vol xAvg</th><th>CMF</th></tr>"
     ]
     for r in rows:
         fmt = lambda x, d=4: f"{x:.{d}f}" if x is not None else "-"
@@ -131,7 +133,7 @@ def generate_html_report(rows, output_path):
             f"<td>{fmt(r['entry_d'])}</td><td>{fmt(r['stop_d'])}</td><td>{fmt(r['target_d'])}</td>"
             f"<td class='{wcls}'>{'BUY' if r['weekly_long'] else '-'}</td>"
             f"<td>{fmt(r['entry_w'])}</td><td>{fmt(r['stop_w'])}</td><td>{fmt(r['target_w'])}</td>"
-            f"<td>{fmt(r['rsi'],2)}</td><td>{fmt(r['adx'],2)}</td><td>{fmt(r['vol_ratio'],2)}</td></tr>"
+            f"<td>{fmt(r['rsi'],2)}</td><td>{fmt(r['adx'],2)}</td><td>{fmt(r['vol_ratio'],2)}</td><td>{fmt(r['cmf'],3)}</td></tr>"
         )
     h.append("</table></body></html>")
     with open(output_path, "w", encoding="utf-8") as f:
@@ -167,7 +169,8 @@ def main():
                 "entry_d": entry_d, "stop_d": stop_d, "target_d": target_d,
                 "entry_w": entry_w, "stop_w": stop_w, "target_w": target_w,
                 "rsi": last_d["rsi"], "adx": last_d["adx"],
-                "vol_ratio": last_d["volume"] / (last_d["vol_sma20"] or 1)
+                "vol_ratio": last_d["volume"] / (last_d["vol_sma20"] or 1),
+                "cmf": last_d.get("cmf", 0),
             })
             time.sleep(0.07)
         except Exception as e:
