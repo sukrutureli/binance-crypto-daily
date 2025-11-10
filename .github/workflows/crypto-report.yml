@@ -3,7 +3,7 @@ name: Crypto Daily Reports
 on:
   workflow_dispatch:
   schedule:
-    - cron: '5 0 * * *'
+    - cron: '5 0 * * *'  # 03:05 TSİ
 
 permissions:
   contents: read
