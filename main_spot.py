@@ -4,15 +4,15 @@ import requests
 import pandas as pd
 
 from ta.trend import EMAIndicator, ADXIndicator, MACD, SMAIndicator
-from ta.momentum import RSIIndicator, ROCIndicator
+from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
 from ta.volume import ChaikinMoneyFlowIndicator, OnBalanceVolumeIndicator
 
 BINANCE_SPOT_BASE = "https://binance-proxy-63js.onrender.com/api"
 
-# ----------------------------------------------------------
-# 1) Sembol Listesi
-# ----------------------------------------------------------
+# ============================================================
+# 1) Spot Sembol Listesi
+# ============================================================
 def get_spot_symbols():
     url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
     data = requests.get(url, timeout=15).json()
@@ -27,82 +27,70 @@ def get_spot_symbols():
     return symbols
 
 
-# ----------------------------------------------------------
-# 2) Kline
-# ----------------------------------------------------------
+# ============================================================
+# 2) Kline Verisi
+# ============================================================
 def get_klines(symbol, interval="1d", limit=120):
     url = f"{BINANCE_SPOT_BASE}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     data = requests.get(url, params=params, timeout=10).json()
     if isinstance(data, dict):
         return None
-
     df = pd.DataFrame(data, columns=[
         "open_time","open","high","low","close","volume",
         "close_time","quote_volume","trades",
         "taker_base_volume","taker_quote_volume","ignore"
     ])
-
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
-
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
     return df
 
 
-# ----------------------------------------------------------
-# 3) İndikatörler
-# ----------------------------------------------------------
+# ============================================================
+# 3) Göstergeler
+# ============================================================
 def compute_indicators(df):
     df = df.copy()
 
-    # EMAs
     df["ema9"] = EMAIndicator(df["close"], 9).ema_indicator()
     df["ema21"] = EMAIndicator(df["close"], 21).ema_indicator()
     df["ema50"] = EMAIndicator(df["close"], 50).ema_indicator()
     df["ema200"] = EMAIndicator(df["close"], 200).ema_indicator()
 
-    # RSI
     df["rsi"] = RSIIndicator(df["close"], 14).rsi()
-
-    # ADX
     df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], 14).adx()
 
-    # MACD
     macd = MACD(df["close"], 26, 12, 9)
     df["macd_line"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
     df["macd_hist"] = macd.macd_diff()
 
-    # SMA20
     df["sma20"] = SMAIndicator(df["close"], 20).sma_indicator()
-
-    # Volume avg
     df["vol_sma20"] = df["volume"].rolling(20).mean()
 
-    # ATR
     df["atr14"] = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
+    df["atr_pct"] = df["atr14"] / df["close"]
 
-    # CMF
     df["cmf"] = ChaikinMoneyFlowIndicator(df["high"], df["low"], df["close"], df["volume"], 20).chaikin_money_flow()
 
-    # OBV
-    df["obv"] = OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
-    df["obv_slope"] = df["obv"].diff()
-
-    # Bollinger Bands
     bb = BollingerBands(df["close"], window=20, window_dev=2)
     df["bb_high"] = bb.bollinger_hband()
     df["bb_low"] = bb.bollinger_lband()
     df["bb_width"] = (df["bb_high"] - df["bb_low"]) / df["close"]
 
+    df["obv"] = OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
+    df["obv_slope"] = df["obv"].diff()
+
     return df
 
 
-# ----------------------------------------------------------
-# 4) Soft Daily / Weekly Filtreler (senin eski ayar)
-# ----------------------------------------------------------
+# ============================================================
+# 4) Günlük Trend Filtreleri
+# ============================================================
 def daily_long_condition(last):
-    if any(pd.isna(last.get(k)) for k in ["ema9","ema21","ema50","rsi","adx","macd_line","macd_signal","vol_sma20"]):
+    if any(pd.isna(last.get(k)) for k in [
+        "ema9","ema21","ema50","rsi","adx","macd_line","macd_signal","vol_sma20"
+    ]):
         return False
     return (
         last["ema9"] > last["ema21"] * 0.995
@@ -110,78 +98,106 @@ def daily_long_condition(last):
         and last["adx"] > 15
         and last["macd_line"] > last["macd_signal"]
         and last["volume"] > 0.9 * (last["vol_sma20"] or 1)
-        and last.get("cmf", 0) > -0.05
-    )
-
-def weekly_long_condition(last):
-    if any(pd.isna(last.get(k)) for k in ["ema9","ema21","rsi","adx","macd_line","macd_signal"]):
-        return False
-    return (
-        last["ema9"] > last["ema21"]
-        and last["rsi"] > 48
-        and last["adx"] > 18
-        and last["macd_line"] > last["macd_signal"]
+        and last["cmf"] > -0.05
     )
 
 
-# ----------------------------------------------------------
-# 5) BullScore
-# ----------------------------------------------------------
+# ============================================================
+# 5) BullScore & Strateji Etiketleri
+# ============================================================
 def compute_bull_score(last):
     score = 0
+    strategies = []
 
-    # Golden Cross
-    if last.get("ema50") and last.get("ema200") and last["ema50"] > last["ema200"]:
+    # 1) Golden Cross
+    if last["ema50"] > last["ema200"]:
         score += 3
+        strategies.append("Golden Cross")
 
-    # Sıkışma
-    if last.get("bb_width") and last["bb_width"] < 0.06 and last.get("atr14") and last["atr14"] / last["close"] < 0.03:
+    # 2) Sıkışma + ATR düşük
+    if last["bb_width"] < 0.06 and last["atr_pct"] < 0.03:
         score += 2
+        strategies.append("Sıkışma (BB+ATR)")
 
-    # MACD uptrend
+    # 3) MACD Momentum
     if last["macd_line"] > last["macd_signal"]:
         score += 1
+        strategies.append("MACD Uptrend")
 
-    # RSI zone
+    # 4) RSI Zone
     if 45 < last["rsi"] < 60:
         score += 1
+        strategies.append("RSI Middle Zone")
 
-    # CMF pozitif
-    if last.get("cmf") and last["cmf"] > 0:
+    # 5) CMF Para Girişi
+    if last["cmf"] > 0:
         score += 1
+        strategies.append("CMF +")
 
-    # OBV
-    if last.get("obv_slope") and last["obv_slope"] > 0:
+    # 6) OBV Breakout
+    if last["obv_slope"] > 0:
         score += 2
+        strategies.append("OBV ↑")
 
-    # Hacim spike
+    # 7) Volume Spike
     if last["volume"] > (last["vol_sma20"] or 1) * 1.3:
         score += 1
+        strategies.append("Volume Spike")
 
-    # Trend bounce
+    # 8) Trend Bounce
     if last["close"] > last["ema50"] and abs(last["close"] - last["sma20"]) / last["close"] < 0.02:
         score += 1
+        strategies.append("Trend Bounce")
 
-    return score
+    return score, ", ".join(strategies)
 
 
-# ----------------------------------------------------------
-# 6) HTML – score.html
-# ----------------------------------------------------------
+# ============================================================
+# 6) Spot HTML
+# ============================================================
+def generate_spot_html(rows, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    h = [
+        "<html><head><meta charset='UTF-8'>",
+        "<title>Binance Spot</title>",
+        "<style>body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px;}table{width:100%;border-collapse:collapse;}th{background:#111827;}tr:nth-child(even){background:#0f172a;}tr:nth-child(odd){background:#1e293b;}td,th{padding:5px;font-size:12px;text-align:right;}.sym{text-align:left;font-weight:bold;}</style>",
+        "</head><body>",
+        "<h1 style='text-align:center;color:#a855f7'>Binance Spot Günlük Analiz</h1>",
+        "<table><tr><th style='text-align:left'>Symbol</th><th>Last</th><th>Daily</th><th>RSI</th><th>ADX</th><th>Vol xAvg</th><th>CMF</th></tr>"
+    ]
+
+    for r in rows:
+        fmt = lambda x, d=4: f"{x:.{d}f}" if x is not None else "-"
+        h.append(
+            f"<tr><td class='sym'>{r['symbol']}</td>"
+            f"<td>{fmt(r['last_price'])}</td>"
+            f"<td>{'BUY' if r['daily_long'] else '-'}</td>"
+            f"<td>{fmt(r['rsi'],2)}</td>"
+            f"<td>{fmt(r['adx'],2)}</td>"
+            f"<td>{fmt(r['vol_ratio'],2)}</td>"
+            f"<td>{fmt(r['cmf'],3)}</td></tr>"
+        )
+
+    h.append("</table></body></html>")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(h))
+
+
+# ============================================================
+# 7) Score HTML
+# ============================================================
 def generate_score_html(rows, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     h = [
-        "<!DOCTYPE html><html><head><meta charset='UTF-8'>",
-        "<title>BullScore Report</title>",
-        "<style>body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px;}"
-        "table{width:100%;border-collapse:collapse;margin-top:20px;}"
-        "th,td{padding:6px;font-size:12px;text-align:right;}th{background:#1e293b;}"
-        "tr:nth-child(even){background:#0f172a;}tr:nth-child(odd){background:#111827;}"
-        ".sym{text-align:left;font-weight:bold;color:#facc15;}</style></head><body>",
-        "<h1 style='text-align:center;color:#facc15'>BullScore - Çıkış Eğilimi Skoru</h1>",
-        "<p style='text-align:center;color:#9ca3af;font-size:12px'>Yatırım tavsiyesi değildir</p>",
-        "<table><tr><th style='text-align:left'>Symbol</th><th>Last</th><th>Score</th><th>RSI</th><th>MACD</th><th>CMF</th><th>ATR%</th></tr>"
+        "<html><head><meta charset='UTF-8'>",
+        "<title>BullScore</title>",
+        "<style>body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px;}table{width:100%;border-collapse:collapse;}th{background:#1e293b;}tr:nth-child(even){background:#0f172a;}tr:nth-child(odd){background:#111827;}td,th{padding:6px;font-size:12px;text-align:right;}.sym{text-align:left;font-weight:bold;color:#facc15;}</style>",
+        "</head><body>",
+        "<h1 style='text-align:center;color:#facc15'>BullScore – Çıkış Eğilimi Skoru</h1>",
+        "<table><tr><th style='text-align:left'>Symbol</th><th>Last</th><th>Score</th><th>Target</th><th>Stratejiler</th><th>RSI</th><th>MACD</th><th>CMF</th><th>ATR%</th></tr>"
     ]
 
     for r in rows:
@@ -190,6 +206,8 @@ def generate_score_html(rows, output_path):
             f"<tr><td class='sym'>{r['symbol']}</td>"
             f"<td>{fmt(r['close'])}</td>"
             f"<td style='font-weight:bold;color:#fcd34d'>{r['score']}</td>"
+            f"<td>{fmt(r['target'],4)}</td>"
+            f"<td style='text-align:left'>{r['strategies']}</td>"
             f"<td>{fmt(r['rsi'],2)}</td>"
             f"<td>{fmt(r['macd'],3)}</td>"
             f"<td>{fmt(r['cmf'],3)}</td>"
@@ -197,68 +215,64 @@ def generate_score_html(rows, output_path):
         )
 
     h.append("</table></body></html>")
+
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(h))
 
 
-# ----------------------------------------------------------
-# 7) Ana Akış
-# ----------------------------------------------------------
+# ============================================================
+# 8) Ana Akış
+# ============================================================
 def main():
     symbols = get_spot_symbols()
-    rows_spot = []
-    rows_score = []
+
+    spot_rows = []
+    score_rows = []
 
     for sym in symbols:
-        try:
-            df_d = get_klines(sym, "1d", 120)
-            df_w = get_klines(sym, "1w", 120)
-
-            if df_d is None or len(df_d) < 60:
-                continue
-
-            df_d = compute_indicators(df_d)
-            last = df_d.iloc[-1]
-
-            # Spot raporu
-            daily = daily_long_condition(last)
-            weekly = weekly_long_condition(last)
-
-            rows_spot.append({
-                "symbol": sym,
-                "last_price": last["close"],
-                "daily_long": daily,
-                "weekly_long": weekly,
-                "rsi": last["rsi"],
-                "adx": last["adx"],
-                "vol_ratio": last["volume"] / (last["vol_sma20"] or 1),
-                "cmf": last["cmf"],
-            })
-
-            # Score raporu
-            score = compute_bull_score(last)
-            rows_score.append({
-                "symbol": sym,
-                "close": last["close"],
-                "score": score,
-                "rsi": last["rsi"],
-                "macd": last["macd_hist"],
-                "cmf": last["cmf"],
-                "atr_pct": last["atr14"] / last["close"],
-            })
-
-            time.sleep(0.07)
-        except:
+        df = get_klines(sym, "1d", 120)
+        if df is None or len(df) < 60:
             continue
 
-    # Spot için eski fonksiyon (senin spot.html'ini çağıracağız)
-    rows_spot_sorted = sorted(rows_spot, key=lambda r: (not r["daily_long"], not r["weekly_long"], -r["adx"]))
-    from main_spot_html_generator import generate_html_report  # Eğer ayrı dosyadaysa
-    generate_html_report(rows_spot_sorted, "public/spot.html")
+        df = compute_indicators(df)
+        last = df.iloc[-1]
 
-    # Score raporu
-    rows_score_sorted = sorted(rows_score, key=lambda r: -r["score"])
-    generate_score_html(rows_score_sorted, "public/score.html")
+        # Spot filtre
+        spot_rows.append({
+            "symbol": sym,
+            "last_price": last["close"],
+            "daily_long": daily_long_condition(last),
+            "rsi": last["rsi"],
+            "adx": last["adx"],
+            "vol_ratio": last["volume"] / (last["vol_sma20"] or 1),
+            "cmf": last["cmf"],
+        })
+
+        # BullScore hesaplama
+        score, strategies = compute_bull_score(last)
+        target = last["close"] + (last["atr14"] * 2.5)   # hedef fiyat eklendi
+
+        score_rows.append({
+            "symbol": sym,
+            "close": last["close"],
+            "score": score,
+            "strategies": strategies,
+            "target": target,
+            "rsi": last["rsi"],
+            "macd": last["macd_hist"],
+            "cmf": last["cmf"],
+            "atr_pct": last["atr_pct"],
+        })
+
+        time.sleep(0.05)
+
+    # Sıralama
+    spot_sorted = sorted(spot_rows, key=lambda r: (-r["daily_long"], -r["adx"]))
+    score_sorted = sorted(score_rows, key=lambda r: -r["score"])
+
+    # HTML üretimi
+    generate_spot_html(spot_sorted, "public/spot.html")
+    generate_score_html(score_sorted, "public/score.html")
 
     print("✅ spot.html ve score.html üretildi")
 
