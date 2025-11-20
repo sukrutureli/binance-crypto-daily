@@ -267,7 +267,7 @@ def main():
         time.sleep(0.05)
 
     # Sıralama
-    spot_sorted = sorted(spot_rows, key=lambda r: (-r["daily_long"], -r["adx"]))
+    spot_sorted = sorted(spot_rows, key=lambda r: (-int(r["daily_long"]), -r["adx"]))
     score_sorted = sorted(score_rows, key=lambda r: -r["score"])
 
     # HTML üretimi
