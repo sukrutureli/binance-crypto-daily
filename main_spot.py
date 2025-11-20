@@ -36,7 +36,6 @@ def get_klines(symbol, interval="1d", limit=120):
     data = requests.get(url, params=params, timeout=10).json()
     if isinstance(data, dict):
         return None
-
     df = pd.DataFrame(data, columns=[
         "open_time","open","high","low","close","volume",
         "close_time","quote_volume","trades",
@@ -53,7 +52,7 @@ def get_klines(symbol, interval="1d", limit=120):
 def compute_indicators(df):
     df = df.copy()
 
-    # Trend / hareketli ortalamalar
+    # EMAs
     df["ema9"] = EMAIndicator(df["close"], 9).ema_indicator()
     df["ema21"] = EMAIndicator(df["close"], 21).ema_indicator()
     df["ema50"] = EMAIndicator(df["close"], 50).ema_indicator()
@@ -69,7 +68,7 @@ def compute_indicators(df):
     df["macd_signal"] = macd.macd_signal()
     df["macd_hist"] = macd.macd_diff()
 
-    # Hacim ortalaması
+    # SMA20 ve hacim ortalaması
     df["sma20"] = SMAIndicator(df["close"], 20).sma_indicator()
     df["vol_sma20"] = df["volume"].rolling(20).mean()
 
@@ -77,7 +76,7 @@ def compute_indicators(df):
     df["atr14"] = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
     df["atr_pct"] = df["atr14"] / df["close"]
 
-    # Para akışı
+    # CMF
     df["cmf"] = ChaikinMoneyFlowIndicator(
         df["high"], df["low"], df["close"], df["volume"], 20
     ).chaikin_money_flow()
@@ -96,12 +95,11 @@ def compute_indicators(df):
 
 
 # ============================================================
-# 4) Günlük Trend Filtreleri (soft mode)
+# 4) Günlük Trend Filtreleri (eski "Daily BUY" mantığı)
 # ============================================================
 def daily_long_condition(last):
-    if any(pd.isna(last.get(k)) for k in [
-        "ema9","ema21","ema50","rsi","adx","macd_line","macd_signal","vol_sma20"
-    ]):
+    required = ["ema9","ema21","ema50","rsi","adx","macd_line","macd_signal","vol_sma20","cmf"]
+    if any(pd.isna(last.get(k)) for k in required):
         return False
 
     return (
@@ -171,99 +169,82 @@ def calc_entry_stop_tp(last, atr_mult_stop=1.5, atr_mult_tp=2.5):
     price = last["close"]
     atr = last.get("atr14")
     if pd.isna(atr) or atr <= 0:
-        # ATR hesaplanamamışsa en azından entry dönsün
+        # ATR yoksa en azından entry döndür
         return price, None, None
 
-    entry = price                   # istersen Binance'de biraz altına limit yazabilirsin
+    entry = price
     stop = max(price - atr_mult_stop * atr, 0)
-    tp = price + atr_mult_tp * atr  # swing hedefi
+    tp = price + atr_mult_tp * atr
 
     return entry, stop, tp
 
 
 # ============================================================
-# 7) spot.html – Basit günlük görünüm
+# 7) Ultra Dashboard HTML (spot.html)
 # ============================================================
-def generate_spot_html(rows, output_path):
+def generate_dashboard_html(rows, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     h = [
-        "<html><head><meta charset='UTF-8'>",
-        "<title>Binance Spot</title>",
-        "<style>body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px;}"
-        "table{width:100%;border-collapse:collapse;}"
-        "th{background:#111827;}tr:nth-child(even){background:#0f172a;}"
-        "tr:nth-child(odd){background:#1e293b;}"
-        "td,th{padding:5px;font-size:12px;text-align:right;}"
-        ".sym{text-align:left;font-weight:bold;}</style>",
-        "</head><body>",
-        "<h1 style='text-align:center;color:#a855f7'>Binance Spot Günlük Analiz</h1>",
-        "<table><tr>"
-        "<th style='text-align:left'>Symbol</th>"
-        "<th>Last</th><th>Daily</th><th>RSI</th><th>ADX</th><th>Vol xAvg</th><th>CMF</th>"
+        "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>",
+        "<title>Binance Spot Dashboard</title>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>",
+        "<style>",
+        "body{font-family:Arial, sans-serif; background:#020617; color:#e5e7eb; padding:20px;}",
+        "h1{ text-align:center; color:#facc15; margin-bottom:8px; }",
+        "p.subtitle{ text-align:center; color:#9ca3af; font-size:12px; margin-top:0; }",
+        "table{width:100%; border-collapse:collapse; margin-top:20px;}",
+        "th,td{padding:6px; font-size:11px; text-align:right;}",
+        "th{background:#111827; position:sticky; top:0; z-index:1;}",
+        "tr:nth-child(even){background:#0f172a;}",
+        "tr:nth-child(odd){background:#1f2937;}",
+        ".sym{text-align:left; font-weight:bold;}",
+        ".score-high{color:#fcd34d; font-weight:bold;}",
+        ".buy{color:#22c55e; font-weight:bold;}",
+        ".nowrap{white-space:nowrap;}",
+        "</style></head><body>",
+        "<h1>Binance Spot – Ultra Dashboard</h1>",
+        "<p class='subtitle'>BullScore, günlük trend, ATR tabanlı entry/stop/TP ve temel indikatörler tek tabloda. Yatırım tavsiyesi değildir.</p>",
+        "<table>",
+        "<tr>",
+        "<th style='text-align:left'>Symbol</th>",
+        "<th>Score</th>",
+        "<th>Last</th>",
+        "<th>Daily</th>",
+        "<th>Entry</th>",
+        "<th>Stop</th>",
+        "<th>TP</th>",
+        "<th>RSI</th>",
+        "<th>ADX</th>",
+        "<th>Vol xAvg</th>",
+        "<th>CMF</th>",
+        "<th>ATR%</th>",
+        "<th style='text-align:left'>Stratejiler</th>",
         "</tr>"
     ]
 
     for r in rows:
         fmt = lambda x, d=4: f"{x:.{d}f}" if x is not None else "-"
+        score_cls = "score-high" if r["score"] >= 6 else ""
+        daily_txt = "BUY" if r["daily_long"] else "-"
+        daily_cls = "buy" if r["daily_long"] else ""
+
         h.append(
-            f"<tr><td class='sym'>{r['symbol']}</td>"
-            f"<td>{fmt(r['last_price'])}</td>"
-            f"<td>{'BUY' if r['daily_long'] else '-'}</td>"
-            f"<td>{fmt(r['rsi'],2)}</td>"
-            f"<td>{fmt(r['adx'],2)}</td>"
-            f"<td>{fmt(r['vol_ratio'],2)}</td>"
-            f"<td>{fmt(r['cmf'],3)}</td></tr>"
-        )
-
-    h.append("</table></body></html>")
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(h))
-
-
-# ============================================================
-# 8) score.html – Entry / Stop / TP’li BullScore tablosu
-# ============================================================
-def generate_score_html(rows, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    h = [
-        "<html><head><meta charset='UTF-8'>",
-        "<title>BullScore</title>",
-        "<style>body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px;}"
-        "table{width:100%;border-collapse:collapse;}"
-        "th{background:#1e293b;}tr:nth-child(even){background:#0f172a;}"
-        "tr:nth-child(odd){background:#111827;}"
-        "td,th{padding:6px;font-size:12px;text-align:right;}"
-        ".sym{text-align:left;font-weight:bold;color:#facc15;}</style>",
-        "</head><body>",
-        "<h1 style='text-align:center;color:#facc15'>BullScore – Çıkış Eğilimi Skoru</h1>",
-        "<p style='text-align:center;color:#9ca3af;font-size:12px'>"
-        "Entry/Stop/TP seviyeleri ATR tabanlı swing hesaplarıdır. Yatırım tavsiyesi değildir."
-        "</p>",
-        "<table><tr>"
-        "<th style='text-align:left'>Symbol</th>"
-        "<th>Last</th><th>Entry</th><th>Stop</th><th>TP</th>"
-        "<th>Score</th><th>Stratejiler</th>"
-        "<th>RSI</th><th>MACD</th><th>CMF</th><th>ATR%</th>"
-        "</tr>"
-    ]
-
-    for r in rows:
-        fmt = lambda x, d=4: f"{x:.{d}f}" if x is not None else "-"
-        h.append(
-            f"<tr><td class='sym'>{r['symbol']}</td>"
+            "<tr>"
+            f"<td class='sym'>{r['symbol']}</td>"
+            f"<td class='{score_cls}'>{r['score']}</td>"
             f"<td>{fmt(r['close'])}</td>"
+            f"<td class='{daily_cls}'>{daily_txt}</td>"
             f"<td>{fmt(r['entry'])}</td>"
             f"<td>{fmt(r['stop'])}</td>"
             f"<td>{fmt(r['tp'])}</td>"
-            f"<td style='font-weight:bold;color:#fcd34d'>{r['score']}</td>"
-            f"<td style='text-align:left'>{r['strategies']}</td>"
             f"<td>{fmt(r['rsi'],2)}</td>"
-            f"<td>{fmt(r['macd'],3)}</td>"
+            f"<td>{fmt(r['adx'],2)}</td>"
+            f"<td>{fmt(r['vol_ratio'],2)}</td>"
             f"<td>{fmt(r['cmf'],3)}</td>"
-            f"<td>{fmt(r['atr_pct'],3)}</td></tr>"
+            f"<td>{fmt(r['atr_pct'],3)}</td>"
+            f"<td style='text-align:left' class='nowrap'>{r['strategies']}</td>"
+            "</tr>"
         )
 
     h.append("</table></body></html>")
@@ -273,13 +254,11 @@ def generate_score_html(rows, output_path):
 
 
 # ============================================================
-# 9) Ana Akış
+# 8) Ana Akış
 # ============================================================
 def main():
     symbols = get_spot_symbols()
-
-    spot_rows = []
-    score_rows = []
+    rows = []
 
     for sym in symbols:
         try:
@@ -290,58 +269,40 @@ def main():
             df = compute_indicators(df)
             last = df.iloc[-1]
 
-            # Spot görünümü için
             daily = daily_long_condition(last)
             vol_ratio = last["volume"] / (last["vol_sma20"] or 1)
+            score, strategies = compute_bull_score(last)
+            entry, stop, tp = calc_entry_stop_tp(last)
 
-            spot_rows.append({
+            rows.append({
                 "symbol": sym,
-                "last_price": last["close"],
+                "close": last["close"],
+                "score": score,
                 "daily_long": daily,
+                "entry": entry,
+                "stop": stop,
+                "tp": tp,
                 "rsi": last["rsi"],
                 "adx": last["adx"],
                 "vol_ratio": vol_ratio,
                 "cmf": last["cmf"],
-            })
-
-            # BullScore + Entry/Stop/TP için
-            score, strategies = compute_bull_score(last)
-            entry, stop, tp = calc_entry_stop_tp(last)
-
-            score_rows.append({
-                "symbol": sym,
-                "close": last["close"],
-                "entry": entry,
-                "stop": stop,
-                "tp": tp,
-                "score": score,
-                "strategies": strategies,
-                "rsi": last["rsi"],
-                "macd": last["macd_hist"],
-                "cmf": last["cmf"],
                 "atr_pct": last["atr_pct"],
+                "strategies": strategies,
             })
 
             time.sleep(0.05)
         except Exception:
-            # Hata olsa bile diğer sembollere geç
             continue
 
-    # Sıralama
-    spot_sorted = sorted(
-        spot_rows,
-        key=lambda r: (-int(r["daily_long"]), -r["adx"])
-    )
-    score_sorted = sorted(
-        score_rows,
-        key=lambda r: -r["score"]
+    # Skora göre, sonra Daily BUY, sonra ADX’e göre sırala
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (-r["score"], -int(r["daily_long"]), -r["adx"])
     )
 
-    # HTML üretimi
-    generate_spot_html(spot_sorted, "public/spot.html")
-    generate_score_html(score_sorted, "public/score.html")
-
-    print("✅ spot.html ve score.html üretildi")
+    os.makedirs("public", exist_ok=True)
+    generate_dashboard_html(rows_sorted, "public/spot.html")
+    print("✅ spot.html (Ultra Dashboard) üretildi")
 
 
 if __name__ == "__main__":
