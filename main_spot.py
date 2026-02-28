@@ -13,8 +13,13 @@ from ta.volume import ChaikinMoneyFlowIndicator, OnBalanceVolumeIndicator
 # ============================================================
 # CONFIG
 # ============================================================
-BINANCE_BASE = "https://binance-proxy-63js.onrender.com"
-FUTURES_BASE = f"{BINANCE_BASE}/fapi"  # USDT-M Futures endpoints
+# Proxy artık /fapi için 403 veriyor -> futures için direkt Binance kullanıyoruz
+FUTURES_BASES = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+]
 
 INTERVAL = os.getenv("INTERVAL", "1h")         # 15m / 1h / 4h / 1d
 LIMIT = int(os.getenv("LIMIT", "300"))         # 200+ önerilir
@@ -29,39 +34,52 @@ ATR_TP_MULT = float(os.getenv("ATR_TP", "2.5"))
 
 STABLECOINS = {"USDT", "BUSD", "DAI", "USDC", "TUSD", "FDUSD"}
 
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; CryptoDailyBot/1.0; +https://github.com/)",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+}
+
 
 # ============================================================
-# Robust GET JSON (proxy bazen boş/HTML/502 döndürür)
+# Robust JSON with multi-base failover
 # ============================================================
-def get_json(url, params=None, timeout=15, retries=6, backoff=1.5):
+def get_json_multi(path, params=None, timeout=15, retries=3, backoff=1.2):
+    """
+    FUTURES_BASES içinde sırayla dener.
+    403/5xx/HTML gibi durumlarda otomatik diğer base'e geçer.
+    """
     last_err = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            text = (r.text or "").strip()
+    for base in FUTURES_BASES:
+        url = base + path
+        for i in range(retries):
+            try:
+                r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HEADERS)
+                text = (r.text or "").strip()
 
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code} | {url} | first100={text[:100]}"
+                if r.status_code != 200:
+                    last_err = f"HTTP {r.status_code} | {url} | first100={text[:100]}"
+                    time.sleep(backoff * (i + 1))
+                    continue
+
+                if not text:
+                    last_err = f"Empty response | {url}"
+                    time.sleep(backoff * (i + 1))
+                    continue
+
+                # JSON parse
+                return r.json()
+
+            except ValueError as e:
+                last_err = f"JSON decode failed | {url} | {str(e)} | first100={text[:100] if 'text' in locals() else ''}"
+                time.sleep(backoff * (i + 1))
+                continue
+            except requests.RequestException as e:
+                last_err = f"Request failed | {url} | {str(e)}"
                 time.sleep(backoff * (i + 1))
                 continue
 
-            if not text:
-                last_err = f"Empty response | {url}"
-                time.sleep(backoff * (i + 1))
-                continue
-
-            return r.json()
-
-        except ValueError as e:  # JSONDecodeError burada yakalanır
-            last_err = f"JSON decode failed | {url} | {str(e)} | first100={((r.text or '')[:100] if 'r' in locals() else '')}"
-            time.sleep(backoff * (i + 1))
-            continue
-        except requests.RequestException as e:
-            last_err = f"Request failed | {url} | {str(e)}"
-            time.sleep(backoff * (i + 1))
-            continue
-
-    print(f"❌ get_json failed after {retries} retries. {last_err}")
+    print(f"❌ get_json_multi failed. {last_err}")
     return None
 
 
@@ -69,10 +87,9 @@ def get_json(url, params=None, timeout=15, retries=6, backoff=1.5):
 # 1) Futures Sembol Listesi (USDT-M perpetual)
 # ============================================================
 def get_futures_symbols_usdtm():
-    url = f"{FUTURES_BASE}/v1/exchangeInfo"
-    data = get_json(url, timeout=20, retries=7, backoff=1.6)
+    data = get_json_multi("/fapi/v1/exchangeInfo", timeout=20, retries=4, backoff=1.3)
     if not data:
-        print("❌ exchangeInfo alınamadı (proxy/HTTP/JSON sorunu).")
+        print("❌ exchangeInfo alınamadı (Binance erişimi yok/blocked).")
         return []
 
     out = []
@@ -95,9 +112,8 @@ def get_futures_symbols_usdtm():
 # 2) Kline Verisi (Futures)
 # ============================================================
 def get_futures_klines(symbol, interval=INTERVAL, limit=LIMIT):
-    url = f"{FUTURES_BASE}/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = get_json(url, params=params, timeout=20, retries=5, backoff=1.3)
+    data = get_json_multi("/fapi/v1/klines", params=params, timeout=20, retries=3, backoff=1.2)
     if not data or isinstance(data, dict):
         return None
 
@@ -136,9 +152,7 @@ def compute_indicators(df):
     df["atr14"] = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
     df["atr_pct"] = df["atr14"] / df["close"] * 100
 
-    df["cmf"] = ChaikinMoneyFlowIndicator(
-        df["high"], df["low"], df["close"], df["volume"], 20
-    ).chaikin_money_flow()
+    df["cmf"] = ChaikinMoneyFlowIndicator(df["high"], df["low"], df["close"], df["volume"], 20).chaikin_money_flow()
 
     bb = BollingerBands(df["close"], window=20, window_dev=2)
     df["bb_high"] = bb.bollinger_hband()
@@ -158,7 +172,6 @@ def long_condition(last):
     req = ["ema9", "ema21", "ema50", "rsi", "adx", "macd_line", "macd_signal", "vol_sma20", "cmf"]
     if any(pd.isna(last.get(k)) for k in req):
         return False
-
     return (
         last["ema9"] > last["ema21"] * 0.995
         and last["ema21"] > last["ema50"] * 0.995
@@ -174,7 +187,6 @@ def short_condition(last):
     req = ["ema9", "ema21", "ema50", "rsi", "adx", "macd_line", "macd_signal", "vol_sma20", "cmf"]
     if any(pd.isna(last.get(k)) for k in req):
         return False
-
     return (
         last["ema9"] < last["ema21"] * 1.005
         and last["ema21"] < last["ema50"] * 1.005
@@ -364,12 +376,12 @@ def generate_html(rows, output_path, title):
 def main():
     symbols = get_futures_symbols_usdtm()
 
-    # Proxy/Binance erişimi yoksa workflow fail olmasın diye boş sayfa üret
+    # erişim yoksa workflow fail olmasın
     if not symbols:
         title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard (NO DATA)"
         os.makedirs("public", exist_ok=True)
         generate_html([], "public/futures_ls.html", title)
-        generate_html([], "public/spot.html", title)  # eski düzen bozulmasın
+        generate_html([], "public/spot.html", title)
         print("⚠️ Sembol listesi boş. Boş dashboard basıldı, çıkılıyor.")
         return
 
@@ -432,7 +444,7 @@ def main():
     os.makedirs("public", exist_ok=True)
     title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard"
     generate_html(rows_sorted, "public/futures_ls.html", title)
-    generate_html(rows_sorted, "public/spot.html", title)  # workflow/index bozulmasın
+    generate_html(rows_sorted, "public/spot.html", title)  # index/workflow bozulmasın
     print(f"✅ Dashboard üretildi: public/futures_ls.html ve public/spot.html | rows={len(rows_sorted)}")
 
 
