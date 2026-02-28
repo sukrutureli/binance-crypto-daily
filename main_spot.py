@@ -31,11 +31,49 @@ STABLECOINS = {"USDT", "BUSD", "DAI", "USDC", "TUSD", "FDUSD"}
 
 
 # ============================================================
+# Robust GET JSON (proxy bazen boş/HTML/502 döndürür)
+# ============================================================
+def get_json(url, params=None, timeout=15, retries=6, backoff=1.5):
+    last_err = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            text = (r.text or "").strip()
+
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code} | {url} | first100={text[:100]}"
+                time.sleep(backoff * (i + 1))
+                continue
+
+            if not text:
+                last_err = f"Empty response | {url}"
+                time.sleep(backoff * (i + 1))
+                continue
+
+            return r.json()
+
+        except ValueError as e:  # JSONDecodeError burada yakalanır
+            last_err = f"JSON decode failed | {url} | {str(e)} | first100={((r.text or '')[:100] if 'r' in locals() else '')}"
+            time.sleep(backoff * (i + 1))
+            continue
+        except requests.RequestException as e:
+            last_err = f"Request failed | {url} | {str(e)}"
+            time.sleep(backoff * (i + 1))
+            continue
+
+    print(f"❌ get_json failed after {retries} retries. {last_err}")
+    return None
+
+
+# ============================================================
 # 1) Futures Sembol Listesi (USDT-M perpetual)
 # ============================================================
 def get_futures_symbols_usdtm():
     url = f"{FUTURES_BASE}/v1/exchangeInfo"
-    data = requests.get(url, timeout=15).json()
+    data = get_json(url, timeout=20, retries=7, backoff=1.6)
+    if not data:
+        print("❌ exchangeInfo alınamadı (proxy/HTTP/JSON sorunu).")
+        return []
 
     out = []
     for s in data.get("symbols", []):
@@ -59,16 +97,16 @@ def get_futures_symbols_usdtm():
 def get_futures_klines(symbol, interval=INTERVAL, limit=LIMIT):
     url = f"{FUTURES_BASE}/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = requests.get(url, params=params, timeout=12).json()
-    if isinstance(data, dict):
+    data = get_json(url, params=params, timeout=20, retries=5, backoff=1.3)
+    if not data or isinstance(data, dict):
         return None
 
     df = pd.DataFrame(data, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","quote_volume","trades",
-        "taker_base_volume","taker_quote_volume","ignore"
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_base_volume", "taker_quote_volume", "ignore"
     ])
-    for col in ["open","high","low","close","volume"]:
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     return df
 
@@ -79,23 +117,23 @@ def get_futures_klines(symbol, interval=INTERVAL, limit=LIMIT):
 def compute_indicators(df):
     df = df.copy()
 
-    df["ema9"]   = EMAIndicator(df["close"], 9).ema_indicator()
-    df["ema21"]  = EMAIndicator(df["close"], 21).ema_indicator()
-    df["ema50"]  = EMAIndicator(df["close"], 50).ema_indicator()
+    df["ema9"] = EMAIndicator(df["close"], 9).ema_indicator()
+    df["ema21"] = EMAIndicator(df["close"], 21).ema_indicator()
+    df["ema50"] = EMAIndicator(df["close"], 50).ema_indicator()
     df["ema200"] = EMAIndicator(df["close"], 200).ema_indicator()
 
     df["rsi"] = RSIIndicator(df["close"], 14).rsi()
     df["adx"] = ADXIndicator(df["high"], df["low"], df["close"], 14).adx()
 
     macd = MACD(df["close"], 26, 12, 9)
-    df["macd_line"]   = macd.macd()
+    df["macd_line"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
-    df["macd_hist"]   = macd.macd_diff()
+    df["macd_hist"] = macd.macd_diff()
 
-    df["sma20"]     = SMAIndicator(df["close"], 20).sma_indicator()
+    df["sma20"] = SMAIndicator(df["close"], 20).sma_indicator()
     df["vol_sma20"] = df["volume"].rolling(20).mean()
 
-    df["atr14"]   = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
+    df["atr14"] = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
     df["atr_pct"] = df["atr14"] / df["close"] * 100
 
     df["cmf"] = ChaikinMoneyFlowIndicator(
@@ -103,11 +141,11 @@ def compute_indicators(df):
     ).chaikin_money_flow()
 
     bb = BollingerBands(df["close"], window=20, window_dev=2)
-    df["bb_high"]  = bb.bollinger_hband()
-    df["bb_low"]   = bb.bollinger_lband()
+    df["bb_high"] = bb.bollinger_hband()
+    df["bb_low"] = bb.bollinger_lband()
     df["bb_width"] = (df["bb_high"] - df["bb_low"]) / df["close"]
 
-    df["obv"]       = OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
+    df["obv"] = OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
     df["obv_slope"] = df["obv"].diff()
 
     return df
@@ -117,7 +155,7 @@ def compute_indicators(df):
 # 4) Long / Short Sinyal Koşulları
 # ============================================================
 def long_condition(last):
-    req = ["ema9","ema21","ema50","rsi","adx","macd_line","macd_signal","vol_sma20","cmf"]
+    req = ["ema9", "ema21", "ema50", "rsi", "adx", "macd_line", "macd_signal", "vol_sma20", "cmf"]
     if any(pd.isna(last.get(k)) for k in req):
         return False
 
@@ -133,7 +171,7 @@ def long_condition(last):
 
 
 def short_condition(last):
-    req = ["ema9","ema21","ema50","rsi","adx","macd_line","macd_signal","vol_sma20","cmf"]
+    req = ["ema9", "ema21", "ema50", "rsi", "adx", "macd_line", "macd_signal", "vol_sma20", "cmf"]
     if any(pd.isna(last.get(k)) for k in req):
         return False
 
@@ -175,22 +213,29 @@ def compute_score_and_badges(last, side):
         strong.append("Sıkışma (BB+ATR)")
 
     if side == "LONG" and last["macd_line"] > last["macd_signal"]:
-        score += 1; moderate.append("MACD Up")
+        score += 1
+        moderate.append("MACD Up")
     if side == "SHORT" and last["macd_line"] < last["macd_signal"]:
-        score += 1; moderate.append("MACD Down")
+        score += 1
+        moderate.append("MACD Down")
 
     if side == "LONG" and 45 < last["rsi"] < 60:
-        score += 1; moderate.append("RSI Zone")
+        score += 1
+        moderate.append("RSI Zone")
     if side == "SHORT" and 40 < last["rsi"] < 55:
-        score += 1; moderate.append("RSI Zone")
+        score += 1
+        moderate.append("RSI Zone")
 
     if side == "LONG" and last["cmf"] > 0:
-        score += 1; moderate.append("CMF+")
+        score += 1
+        moderate.append("CMF+")
     if side == "SHORT" and last["cmf"] < 0:
-        score += 1; moderate.append("CMF-")
+        score += 1
+        moderate.append("CMF-")
 
     if last["volume"] > (last["vol_sma20"] or 1) * 1.3:
-        score += 1; moderate.append("Volume Spike")
+        score += 1
+        moderate.append("Volume Spike")
 
     strong_badges = ", ".join(["⭐ " + s for s in strong])
     mod_badges = ", ".join(["• " + s for s in moderate])
@@ -209,14 +254,14 @@ def calc_levels(last, side):
 
     if side == "LONG":
         stop = entry - ATR_STOP_MULT * atr
-        tp   = entry + ATR_TP_MULT * atr
+        tp = entry + ATR_TP_MULT * atr
         stop_pct = (entry - stop) / entry * 100
-        tp_pct   = (tp - entry) / entry * 100
+        tp_pct = (tp - entry) / entry * 100
     else:
         stop = entry + ATR_STOP_MULT * atr
-        tp   = entry - ATR_TP_MULT * atr
+        tp = entry - ATR_TP_MULT * atr
         stop_pct = (stop - entry) / entry * 100
-        tp_pct   = (entry - tp) / entry * 100
+        tp_pct = (entry - tp) / entry * 100
 
     rr = (tp_pct / stop_pct) if stop_pct and stop_pct > 0 else None
     return entry, stop, tp, stop_pct, tp_pct, rr
@@ -226,9 +271,12 @@ def calc_levels(last, side):
 # 7) HTML
 # ============================================================
 def color_rr(v):
-    if v is None: return ""
-    if v >= 1.5: return "background:#064e3b;"
-    if 1.0 <= v < 1.5: return "background:#78350f;"
+    if v is None:
+        return ""
+    if v >= 1.5:
+        return "background:#064e3b;"
+    if 1.0 <= v < 1.5:
+        return "background:#78350f;"
     return "background:#7f1d1d;"
 
 
@@ -271,10 +319,18 @@ def generate_html(rows, output_path, title):
         "</tr>"
     ]
 
-    for r in rows:
-        fmt = lambda x, d=4: f"{x:.{d}f}" if x is not None and not (isinstance(x, float) and math.isnan(x)) else "-"
-        rr_style = color_rr(r["rr"])
+    def fmt(x, d=4):
+        if x is None:
+            return "-"
+        try:
+            if isinstance(x, float) and math.isnan(x):
+                return "-"
+        except Exception:
+            pass
+        return f"{x:.{d}f}"
 
+    for r in rows:
+        rr_style = color_rr(r["rr"])
         h.append(
             "<tr>"
             f"<td class='sym'>{r['symbol']}</td>"
@@ -307,6 +363,16 @@ def generate_html(rows, output_path, title):
 # ============================================================
 def main():
     symbols = get_futures_symbols_usdtm()
+
+    # Proxy/Binance erişimi yoksa workflow fail olmasın diye boş sayfa üret
+    if not symbols:
+        title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard (NO DATA)"
+        os.makedirs("public", exist_ok=True)
+        generate_html([], "public/futures_ls.html", title)
+        generate_html([], "public/spot.html", title)  # eski düzen bozulmasın
+        print("⚠️ Sembol listesi boş. Boş dashboard basıldı, çıkılıyor.")
+        return
+
     rows = []
 
     for sym in symbols:
@@ -357,14 +423,17 @@ def main():
                 })
 
             time.sleep(SLEEP)
+
         except Exception:
             continue
 
     rows_sorted = sorted(rows, key=lambda r: (-r["score"], -r["rr"]))
 
     os.makedirs("public", exist_ok=True)
-    generate_html(rows_sorted, "public/futures_ls.html", "Binance Futures (USDT-M PERP) – Long/Short Dashboard")
-    print(f"✅ Dashboard üretildi: public/futures_ls.html | rows={len(rows_sorted)}")
+    title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard"
+    generate_html(rows_sorted, "public/futures_ls.html", title)
+    generate_html(rows_sorted, "public/spot.html", title)  # workflow/index bozulmasın
+    print(f"✅ Dashboard üretildi: public/futures_ls.html ve public/spot.html | rows={len(rows_sorted)}")
 
 
 if __name__ == "__main__":
