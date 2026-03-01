@@ -13,19 +13,16 @@ from ta.volume import ChaikinMoneyFlowIndicator, OnBalanceVolumeIndicator
 # ============================================================
 # CONFIG
 # ============================================================
-# Proxy artık /fapi için 403 veriyor -> futures için direkt Binance kullanıyoruz
-FUTURES_BASES = [
-    "https://fapi.binance.com",
-    "https://fapi1.binance.com",
-    "https://fapi2.binance.com",
-    "https://fapi3.binance.com",
-]
+# ÖNEMLİ: Senin proxy SPOT'u /api/v3 ile çalıştırıyor.
+# FUTURES için de /api/fapi/... prefix kullanacağız.
+PROXY_BASE = "https://binance-proxy-63js.onrender.com/api"
+FUTURES_BASE = PROXY_BASE  # -> /api/fapi/v1/...
 
 INTERVAL = os.getenv("INTERVAL", "1h")         # 15m / 1h / 4h / 1d
 LIMIT = int(os.getenv("LIMIT", "300"))         # 200+ önerilir
 SLEEP = float(os.getenv("SLEEP", "0.02"))
 
-ONLY_SIGNAL = os.getenv("ONLY_SIGNAL", "1") == "1"   # sadece sinyal olanlar
+ONLY_SIGNAL = os.getenv("ONLY_SIGNAL", "1") == "1"
 SIDE_FILTER = os.getenv("SIDE", "ALL").upper()       # ALL / LONG / SHORT
 MIN_RR = float(os.getenv("MIN_RR", "1.2"))
 MIN_ADX = float(os.getenv("MIN_ADX", "15"))
@@ -34,52 +31,44 @@ ATR_TP_MULT = float(os.getenv("ATR_TP", "2.5"))
 
 STABLECOINS = {"USDT", "BUSD", "DAI", "USDC", "TUSD", "FDUSD"}
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; CryptoDailyBot/1.0; +https://github.com/)",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; CryptoDailyBot/1.0)",
     "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
 }
 
 
 # ============================================================
-# Robust JSON with multi-base failover
+# Robust GET JSON (proxy bazen HTML/boş/403 döndürebilir)
 # ============================================================
-def get_json_multi(path, params=None, timeout=15, retries=3, backoff=1.2):
-    """
-    FUTURES_BASES içinde sırayla dener.
-    403/5xx/HTML gibi durumlarda otomatik diğer base'e geçer.
-    """
+def get_json(url, params=None, timeout=20, retries=6, backoff=1.6):
     last_err = None
-    for base in FUTURES_BASES:
-        url = base + path
-        for i in range(retries):
-            try:
-                r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HEADERS)
-                text = (r.text or "").strip()
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout, headers=HEADERS)
+            text = (r.text or "").strip()
 
-                if r.status_code != 200:
-                    last_err = f"HTTP {r.status_code} | {url} | first100={text[:100]}"
-                    time.sleep(backoff * (i + 1))
-                    continue
-
-                if not text:
-                    last_err = f"Empty response | {url}"
-                    time.sleep(backoff * (i + 1))
-                    continue
-
-                # JSON parse
-                return r.json()
-
-            except ValueError as e:
-                last_err = f"JSON decode failed | {url} | {str(e)} | first100={text[:100] if 'text' in locals() else ''}"
-                time.sleep(backoff * (i + 1))
-                continue
-            except requests.RequestException as e:
-                last_err = f"Request failed | {url} | {str(e)}"
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code} | {url} | first120={text[:120]}"
                 time.sleep(backoff * (i + 1))
                 continue
 
-    print(f"❌ get_json_multi failed. {last_err}")
+            if not text:
+                last_err = f"Empty response | {url}"
+                time.sleep(backoff * (i + 1))
+                continue
+
+            return r.json()
+
+        except ValueError as e:
+            last_err = f"JSON decode failed | {url} | {str(e)}"
+            time.sleep(backoff * (i + 1))
+            continue
+        except requests.RequestException as e:
+            last_err = f"Request failed | {url} | {str(e)}"
+            time.sleep(backoff * (i + 1))
+            continue
+
+    print(f"❌ get_json failed after {retries} retries. {last_err}")
     return None
 
 
@@ -87,9 +76,11 @@ def get_json_multi(path, params=None, timeout=15, retries=3, backoff=1.2):
 # 1) Futures Sembol Listesi (USDT-M perpetual)
 # ============================================================
 def get_futures_symbols_usdtm():
-    data = get_json_multi("/fapi/v1/exchangeInfo", timeout=20, retries=4, backoff=1.3)
+    # DİKKAT: /api + /fapi/v1/exchangeInfo => /api/fapi/v1/exchangeInfo
+    url = f"{FUTURES_BASE}/fapi/v1/exchangeInfo"
+    data = get_json(url, timeout=25, retries=7, backoff=1.7)
     if not data:
-        print("❌ exchangeInfo alınamadı (Binance erişimi yok/blocked).")
+        print("❌ exchangeInfo alınamadı (proxy/HTTP/JSON sorunu).")
         return []
 
     out = []
@@ -112,8 +103,10 @@ def get_futures_symbols_usdtm():
 # 2) Kline Verisi (Futures)
 # ============================================================
 def get_futures_klines(symbol, interval=INTERVAL, limit=LIMIT):
+    url = f"{FUTURES_BASE}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = get_json_multi("/fapi/v1/klines", params=params, timeout=20, retries=3, backoff=1.2)
+    data = get_json(url, params=params, timeout=25, retries=5, backoff=1.4)
+
     if not data or isinstance(data, dict):
         return None
 
@@ -128,7 +121,7 @@ def get_futures_klines(symbol, interval=INTERVAL, limit=LIMIT):
 
 
 # ============================================================
-# 3) Göstergeler
+# 3) Indicators
 # ============================================================
 def compute_indicators(df):
     df = df.copy()
@@ -166,7 +159,7 @@ def compute_indicators(df):
 
 
 # ============================================================
-# 4) Long / Short Sinyal Koşulları
+# 4) Long/Short conditions
 # ============================================================
 def long_condition(last):
     req = ["ema9", "ema21", "ema50", "rsi", "adx", "macd_line", "macd_signal", "vol_sma20", "cmf"]
@@ -199,7 +192,7 @@ def short_condition(last):
 
 
 # ============================================================
-# 5) Skor + Rozetler
+# 5) Score + badges
 # ============================================================
 def compute_score_and_badges(last, side):
     score = 0
@@ -207,56 +200,45 @@ def compute_score_and_badges(last, side):
 
     if side == "LONG":
         if last["ema50"] > last["ema200"]:
-            score += 3
-            strong.append("Golden Cross")
+            score += 3; strong.append("Golden Cross")
         if last["obv_slope"] > 0:
-            score += 2
-            strong.append("OBV ↑")
+            score += 2; strong.append("OBV ↑")
     else:
         if last["ema50"] < last["ema200"]:
-            score += 3
-            strong.append("Death Cross")
+            score += 3; strong.append("Death Cross")
         if last["obv_slope"] < 0:
-            score += 2
-            strong.append("OBV ↓")
+            score += 2; strong.append("OBV ↓")
 
     if last["bb_width"] < 0.06 and last["atr_pct"] < 3:
-        score += 2
-        strong.append("Sıkışma (BB+ATR)")
+        score += 2; strong.append("Sıkışma (BB+ATR)")
 
     if side == "LONG" and last["macd_line"] > last["macd_signal"]:
-        score += 1
-        moderate.append("MACD Up")
+        score += 1; moderate.append("MACD Up")
     if side == "SHORT" and last["macd_line"] < last["macd_signal"]:
-        score += 1
-        moderate.append("MACD Down")
+        score += 1; moderate.append("MACD Down")
 
     if side == "LONG" and 45 < last["rsi"] < 60:
-        score += 1
-        moderate.append("RSI Zone")
+        score += 1; moderate.append("RSI Zone")
     if side == "SHORT" and 40 < last["rsi"] < 55:
-        score += 1
-        moderate.append("RSI Zone")
+        score += 1; moderate.append("RSI Zone")
 
     if side == "LONG" and last["cmf"] > 0:
-        score += 1
-        moderate.append("CMF+")
+        score += 1; moderate.append("CMF+")
     if side == "SHORT" and last["cmf"] < 0:
-        score += 1
-        moderate.append("CMF-")
+        score += 1; moderate.append("CMF-")
 
     if last["volume"] > (last["vol_sma20"] or 1) * 1.3:
-        score += 1
-        moderate.append("Volume Spike")
+        score += 1; moderate.append("Volume Spike")
 
-    strong_badges = ", ".join(["⭐ " + s for s in strong])
-    mod_badges = ", ".join(["• " + s for s in moderate])
-    badges = ", ".join(filter(None, [strong_badges, mod_badges]))
+    badges = ", ".join(filter(None, [
+        ", ".join(["⭐ " + s for s in strong]) if strong else "",
+        ", ".join(["• " + s for s in moderate]) if moderate else ""
+    ]))
     return score, badges
 
 
 # ============================================================
-# 6) Entry / Stop / TP + yüzdeler + R/R
+# 6) Entry/Stop/TP
 # ============================================================
 def calc_levels(last, side):
     entry = float(last["close"])
@@ -283,12 +265,9 @@ def calc_levels(last, side):
 # 7) HTML
 # ============================================================
 def color_rr(v):
-    if v is None:
-        return ""
-    if v >= 1.5:
-        return "background:#064e3b;"
-    if 1.0 <= v < 1.5:
-        return "background:#78350f;"
+    if v is None: return ""
+    if v >= 1.5: return "background:#064e3b;"
+    if 1.0 <= v < 1.5: return "background:#78350f;"
     return "background:#7f1d1d;"
 
 
@@ -310,33 +289,17 @@ def generate_html(rows, output_path, title):
         "</style></head><body>",
         f"<h1 style='text-align:center;color:#facc15;'>{title}</h1>",
         f"<div style='text-align:center;color:#94a3b8;'>interval={INTERVAL} | only_signal={ONLY_SIGNAL} | side={SIDE_FILTER} | minRR={MIN_RR}</div>",
-        "<table>",
-        "<tr>",
-        "<th style='text-align:left'>Symbol</th>",
-        "<th>Side</th>",
-        "<th>Score</th>",
-        "<th>Last</th>",
-        "<th>Entry</th>",
-        "<th>Stop</th>",
-        "<th>TP</th>",
-        "<th>Stop%</th>",
-        "<th>TP%</th>",
-        "<th>R/R</th>",
-        "<th>RSI</th>",
-        "<th>ADX</th>",
-        "<th>ATR%</th>",
-        "<th>Vol xAvg</th>",
-        "<th>CMF</th>",
-        "<th style='text-align:left'>Badges</th>",
+        "<table><tr>",
+        "<th style='text-align:left'>Symbol</th><th>Side</th><th>Score</th><th>Last</th>",
+        "<th>Entry</th><th>Stop</th><th>TP</th><th>Stop%</th><th>TP%</th><th>R/R</th>",
+        "<th>RSI</th><th>ADX</th><th>ATR%</th><th>Vol xAvg</th><th>CMF</th><th style='text-align:left'>Badges</th>",
         "</tr>"
     ]
 
     def fmt(x, d=4):
-        if x is None:
-            return "-"
+        if x is None: return "-"
         try:
-            if isinstance(x, float) and math.isnan(x):
-                return "-"
+            if isinstance(x, float) and math.isnan(x): return "-"
         except Exception:
             pass
         return f"{x:.{d}f}"
@@ -376,9 +339,8 @@ def generate_html(rows, output_path, title):
 def main():
     symbols = get_futures_symbols_usdtm()
 
-    # erişim yoksa workflow fail olmasın
     if not symbols:
-        title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard (NO DATA)"
+        title = "Futures Dashboard (NO DATA - proxy blocked?)"
         os.makedirs("public", exist_ok=True)
         generate_html([], "public/futures_ls.html", title)
         generate_html([], "public/spot.html", title)
@@ -435,17 +397,16 @@ def main():
                 })
 
             time.sleep(SLEEP)
-
         except Exception:
             continue
 
-    rows_sorted = sorted(rows, key=lambda r: (-r["score"], -r["rr"]))
+    rows_sorted = sorted(rows, key=lambda r: (-r["score"], -(r["rr"] or 0)))
 
     os.makedirs("public", exist_ok=True)
     title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard"
     generate_html(rows_sorted, "public/futures_ls.html", title)
     generate_html(rows_sorted, "public/spot.html", title)  # index/workflow bozulmasın
-    print(f"✅ Dashboard üretildi: public/futures_ls.html ve public/spot.html | rows={len(rows_sorted)}")
+    print(f"✅ Dashboard üretildi: rows={len(rows_sorted)}")
 
 
 if __name__ == "__main__":
