@@ -15,7 +15,7 @@ from ta.volume import ChaikinMoneyFlowIndicator, OnBalanceVolumeIndicator
 # ============================================================
 # ÖNEMLİ: Senin proxy SPOT'u /api/v3 ile çalıştırıyor.
 # FUTURES için de /api/fapi/... prefix kullanacağız.
-PROXY_BASE = "https://binance-proxy-63js.onrender.com/api"
+PROXY_BASE = "https://binance-proxy-63js.onrender.com/fapi"
 FUTURES_BASE = PROXY_BASE  # -> /api/fapi/v1/...
 
 INTERVAL = os.getenv("INTERVAL", "1h")         # 15m / 1h / 4h / 1d
