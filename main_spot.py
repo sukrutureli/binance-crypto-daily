@@ -4,6 +4,12 @@ import math
 import requests
 import pandas as pd
 
+from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
+
 from ta.trend import EMAIndicator, ADXIndicator, MACD, SMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
@@ -13,10 +19,10 @@ from ta.volume import ChaikinMoneyFlowIndicator, OnBalanceVolumeIndicator
 # ============================================================
 # CONFIG
 # ============================================================
-# ÖNEMLİ: Senin proxy SPOT'u /api/v3 ile çalıştırıyor.
-# FUTURES için de /api/fapi/... prefix kullanacağız.
+# Bu script Futures verisini senin proxy üzerinden çeker:
+# /fapi/... çağrısı yaptığımız için host + /fapi olmalı.
 PROXY_BASE = "https://binance-proxy-63js.onrender.com/fapi"
-FUTURES_BASE = PROXY_BASE  # -> /api/fapi/v1/...
+FUTURES_BASE = PROXY_BASE
 
 INTERVAL = os.getenv("INTERVAL", "1h")         # 15m / 1h / 4h / 1d
 LIMIT = int(os.getenv("LIMIT", "300"))         # 200+ önerilir
@@ -38,7 +44,21 @@ HEADERS = {
 
 
 # ============================================================
-# Robust GET JSON (proxy bazen HTML/boş/403 döndürebilir)
+# Updated-at helper (TSİ)
+# ============================================================
+def get_updated_at_str():
+    now_utc = datetime.now(timezone.utc)
+    if ZoneInfo is not None:
+        try:
+            ist = now_utc.astimezone(ZoneInfo("Europe/Istanbul"))
+            return ist.strftime("%Y-%m-%d %H:%M:%S %Z")
+        except Exception:
+            pass
+    return now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ============================================================
+# Robust GET JSON
 # ============================================================
 def get_json(url, params=None, timeout=20, retries=6, backoff=1.6):
     last_err = None
@@ -76,7 +96,6 @@ def get_json(url, params=None, timeout=20, retries=6, backoff=1.6):
 # 1) Futures Sembol Listesi (USDT-M perpetual)
 # ============================================================
 def get_futures_symbols_usdtm():
-    # DİKKAT: /api + /fapi/v1/exchangeInfo => /api/fapi/v1/exchangeInfo
     url = f"{FUTURES_BASE}/fapi/v1/exchangeInfo"
     data = get_json(url, timeout=25, retries=7, backoff=1.7)
     if not data:
@@ -265,13 +284,16 @@ def calc_levels(last, side):
 # 7) HTML
 # ============================================================
 def color_rr(v):
-    if v is None: return ""
-    if v >= 1.5: return "background:#064e3b;"
-    if 1.0 <= v < 1.5: return "background:#78350f;"
+    if v is None:
+        return ""
+    if v >= 1.5:
+        return "background:#064e3b;"
+    if 1.0 <= v < 1.5:
+        return "background:#78350f;"
     return "background:#7f1d1d;"
 
 
-def generate_html(rows, output_path, title):
+def generate_html(rows, output_path, title, meta_text):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     h = [
@@ -288,7 +310,7 @@ def generate_html(rows, output_path, title):
         ".side{text-align:center;font-weight:bold;}",
         "</style></head><body>",
         f"<h1 style='text-align:center;color:#facc15;'>{title}</h1>",
-        f"<div style='text-align:center;color:#94a3b8;'>interval={INTERVAL} | only_signal={ONLY_SIGNAL} | side={SIDE_FILTER} | minRR={MIN_RR}</div>",
+        f"<div style='text-align:center;color:#94a3b8;'>{meta_text}</div>",
         "<table><tr>",
         "<th style='text-align:left'>Symbol</th><th>Side</th><th>Score</th><th>Last</th>",
         "<th>Entry</th><th>Stop</th><th>TP</th><th>Stop%</th><th>TP%</th><th>R/R</th>",
@@ -297,9 +319,11 @@ def generate_html(rows, output_path, title):
     ]
 
     def fmt(x, d=4):
-        if x is None: return "-"
+        if x is None:
+            return "-"
         try:
-            if isinstance(x, float) and math.isnan(x): return "-"
+            if isinstance(x, float) and math.isnan(x):
+                return "-"
         except Exception:
             pass
         return f"{x:.{d}f}"
@@ -337,13 +361,17 @@ def generate_html(rows, output_path, title):
 # 8) MAIN
 # ============================================================
 def main():
+    updated_at = get_updated_at_str()
+
     symbols = get_futures_symbols_usdtm()
+    total_symbols = len(symbols)
 
     if not symbols:
         title = "Futures Dashboard (NO DATA - proxy blocked?)"
         os.makedirs("public", exist_ok=True)
-        generate_html([], "public/futures_ls.html", title)
-        generate_html([], "public/spot.html", title)
+        meta = f"Güncellendi: {updated_at} | interval={INTERVAL} | only_signal={ONLY_SIGNAL} | side={SIDE_FILTER} | minRR={MIN_RR} | symbols=0 | rows=0"
+        generate_html([], "public/futures_ls.html", title, meta)
+        generate_html([], "public/spot.html", title, meta)
         print("⚠️ Sembol listesi boş. Boş dashboard basıldı, çıkılıyor.")
         return
 
@@ -404,8 +432,12 @@ def main():
 
     os.makedirs("public", exist_ok=True)
     title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard"
-    generate_html(rows_sorted, "public/futures_ls.html", title)
-    generate_html(rows_sorted, "public/spot.html", title)  # index/workflow bozulmasın
+    meta = (
+        f"Güncellendi: {updated_at} | interval={INTERVAL} | only_signal={ONLY_SIGNAL} | side={SIDE_FILTER} "
+        f"| minRR={MIN_RR} | symbols={total_symbols} | rows={len(rows_sorted)}"
+    )
+    generate_html(rows_sorted, "public/futures_ls.html", title, meta)
+    generate_html(rows_sorted, "public/spot.html", title, meta)  # index/workflow bozulmasın
     print(f"✅ Dashboard üretildi: rows={len(rows_sorted)}")
 
 
