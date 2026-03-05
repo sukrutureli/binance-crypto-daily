@@ -19,21 +19,45 @@ from ta.volume import ChaikinMoneyFlowIndicator, OnBalanceVolumeIndicator
 # ============================================================
 # CONFIG
 # ============================================================
-# Bu script Futures verisini senin proxy üzerinden çeker:
-# /fapi/... çağrısı yaptığımız için host + /fapi olmalı.
 PROXY_BASE = "https://binance-proxy-63js.onrender.com/fapi"
 FUTURES_BASE = PROXY_BASE
 
-INTERVAL = os.getenv("INTERVAL", "1h")         # 15m / 1h / 4h / 1d
-LIMIT = int(os.getenv("LIMIT", "300"))         # 200+ önerilir
+INTERVAL = os.getenv("INTERVAL", "1h")   # 15m / 1h / 4h / 1d
+LIMIT = int(os.getenv("LIMIT", "300"))
 SLEEP = float(os.getenv("SLEEP", "0.02"))
 
-ONLY_SIGNAL = os.getenv("ONLY_SIGNAL", "1") == "1"
-SIDE_FILTER = os.getenv("SIDE", "ALL").upper()       # ALL / LONG / SHORT
+# Global filters
+SIDE_FILTER = os.getenv("SIDE", "ALL").upper()  # ALL / LONG / SHORT
 MIN_RR = float(os.getenv("MIN_RR", "1.2"))
 MIN_ADX = float(os.getenv("MIN_ADX", "15"))
+
+# ATR risk
 ATR_STOP_MULT = float(os.getenv("ATR_STOP", "1.5"))
 ATR_TP_MULT = float(os.getenv("ATR_TP", "2.5"))
+
+# Strategy-specific knobs
+# Trend/Momentum (opt)
+TM_REQUIRE_SQUEEZE = os.getenv("TM_REQUIRE_SQUEEZE", "1") == "1"
+TM_MAX_BB_WIDTH = float(os.getenv("TM_MAX_BB_WIDTH", "0.085"))
+TM_MAX_ATR_PCT = float(os.getenv("TM_MAX_ATR_PCT", "6.5"))
+TM_RSI_LONG_MIN = float(os.getenv("TM_RSI_LONG_MIN", "45"))
+TM_RSI_LONG_MAX = float(os.getenv("TM_RSI_LONG_MAX", "66"))
+TM_RSI_SHORT_MIN = float(os.getenv("TM_RSI_SHORT_MIN", "34"))
+TM_RSI_SHORT_MAX = float(os.getenv("TM_RSI_SHORT_MAX", "55"))
+TM_VOL_MIN_RATIO = float(os.getenv("TM_VOL_MIN_RATIO", "0.95"))      # volume >= 0.95 * avg
+TM_CMF_LONG_MIN = float(os.getenv("TM_CMF_LONG_MIN", "-0.02"))
+TM_CMF_SHORT_MAX = float(os.getenv("TM_CMF_SHORT_MAX", "0.02"))
+TM_MIN_SCORE = int(os.getenv("TM_MIN_SCORE", "5"))                   # more selective
+TM_MAX_ROWS = int(os.getenv("TM_MAX_ROWS", "80"))
+
+# Breakout+Retest
+BR_LOOKBACK = int(os.getenv("BR_LOOKBACK", "50"))      # breakout level lookback
+BR_RETEST_ATR = float(os.getenv("BR_RETEST_ATR", "0.35"))  # retest tolerance (ATR fraction)
+BR_REQUIRE_SQUEEZE = os.getenv("BR_REQUIRE_SQUEEZE", "1") == "1"
+BR_MAX_BB_WIDTH = float(os.getenv("BR_MAX_BB_WIDTH", "0.07"))
+BR_MAX_ATR_PCT = float(os.getenv("BR_MAX_ATR_PCT", "5.0"))
+BR_MIN_SCORE = int(os.getenv("BR_MIN_SCORE", "6"))
+BR_MAX_ROWS = int(os.getenv("BR_MAX_ROWS", "80"))
 
 STABLECOINS = {"USDT", "BUSD", "DAI", "USDC", "TUSD", "FDUSD"}
 
@@ -44,7 +68,7 @@ HEADERS = {
 
 
 # ============================================================
-# Updated-at helper (TSİ)
+# Time helper (TSİ)
 # ============================================================
 def get_updated_at_str():
     now_utc = datetime.now(timezone.utc)
@@ -93,7 +117,7 @@ def get_json(url, params=None, timeout=20, retries=6, backoff=1.6):
 
 
 # ============================================================
-# 1) Futures Sembol Listesi (USDT-M perpetual)
+# 1) Futures symbols (USDT-M PERP)
 # ============================================================
 def get_futures_symbols_usdtm():
     url = f"{FUTURES_BASE}/fapi/v1/exchangeInfo"
@@ -119,7 +143,7 @@ def get_futures_symbols_usdtm():
 
 
 # ============================================================
-# 2) Kline Verisi (Futures)
+# 2) Futures klines
 # ============================================================
 def get_futures_klines(symbol, interval=INTERVAL, limit=LIMIT):
     url = f"{FUTURES_BASE}/fapi/v1/klines"
@@ -174,90 +198,16 @@ def compute_indicators(df):
     df["obv"] = OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
     df["obv_slope"] = df["obv"].diff()
 
+    # Breakout levels
+    # shifting to avoid "using current candle"
+    df["hh"] = df["high"].rolling(BR_LOOKBACK).max().shift(1)
+    df["ll"] = df["low"].rolling(BR_LOOKBACK).min().shift(1)
+
     return df
 
 
 # ============================================================
-# 4) Long/Short conditions
-# ============================================================
-def long_condition(last):
-    req = ["ema9", "ema21", "ema50", "rsi", "adx", "macd_line", "macd_signal", "vol_sma20", "cmf"]
-    if any(pd.isna(last.get(k)) for k in req):
-        return False
-    return (
-        last["ema9"] > last["ema21"] * 0.995
-        and last["ema21"] > last["ema50"] * 0.995
-        and 42 < last["rsi"] < 68
-        and last["adx"] >= MIN_ADX
-        and last["macd_line"] > last["macd_signal"]
-        and last["volume"] > 0.8 * (last["vol_sma20"] or 1)
-        and last["cmf"] > -0.10
-    )
-
-
-def short_condition(last):
-    req = ["ema9", "ema21", "ema50", "rsi", "adx", "macd_line", "macd_signal", "vol_sma20", "cmf"]
-    if any(pd.isna(last.get(k)) for k in req):
-        return False
-    return (
-        last["ema9"] < last["ema21"] * 1.005
-        and last["ema21"] < last["ema50"] * 1.005
-        and 32 < last["rsi"] < 58
-        and last["adx"] >= MIN_ADX
-        and last["macd_line"] < last["macd_signal"]
-        and last["volume"] > 0.8 * (last["vol_sma20"] or 1)
-        and last["cmf"] < 0.10
-    )
-
-
-# ============================================================
-# 5) Score + badges
-# ============================================================
-def compute_score_and_badges(last, side):
-    score = 0
-    strong, moderate = [], []
-
-    if side == "LONG":
-        if last["ema50"] > last["ema200"]:
-            score += 3; strong.append("Golden Cross")
-        if last["obv_slope"] > 0:
-            score += 2; strong.append("OBV ↑")
-    else:
-        if last["ema50"] < last["ema200"]:
-            score += 3; strong.append("Death Cross")
-        if last["obv_slope"] < 0:
-            score += 2; strong.append("OBV ↓")
-
-    if last["bb_width"] < 0.06 and last["atr_pct"] < 3:
-        score += 2; strong.append("Sıkışma (BB+ATR)")
-
-    if side == "LONG" and last["macd_line"] > last["macd_signal"]:
-        score += 1; moderate.append("MACD Up")
-    if side == "SHORT" and last["macd_line"] < last["macd_signal"]:
-        score += 1; moderate.append("MACD Down")
-
-    if side == "LONG" and 45 < last["rsi"] < 60:
-        score += 1; moderate.append("RSI Zone")
-    if side == "SHORT" and 40 < last["rsi"] < 55:
-        score += 1; moderate.append("RSI Zone")
-
-    if side == "LONG" and last["cmf"] > 0:
-        score += 1; moderate.append("CMF+")
-    if side == "SHORT" and last["cmf"] < 0:
-        score += 1; moderate.append("CMF-")
-
-    if last["volume"] > (last["vol_sma20"] or 1) * 1.3:
-        score += 1; moderate.append("Volume Spike")
-
-    badges = ", ".join(filter(None, [
-        ", ".join(["⭐ " + s for s in strong]) if strong else "",
-        ", ".join(["• " + s for s in moderate]) if moderate else ""
-    ]))
-    return score, badges
-
-
-# ============================================================
-# 6) Entry/Stop/TP
+# 4) Common: ATR levels
 # ============================================================
 def calc_levels(last, side):
     entry = float(last["close"])
@@ -280,53 +230,211 @@ def calc_levels(last, side):
     return entry, stop, tp, stop_pct, tp_pct, rr
 
 
+def squeeze_ok(last, max_bb_width, max_atr_pct):
+    if pd.isna(last.get("bb_width")) or pd.isna(last.get("atr_pct")):
+        return False
+    return (last["bb_width"] <= max_bb_width) and (last["atr_pct"] <= max_atr_pct)
+
+
 # ============================================================
-# 7) HTML
+# 5) Strategy A: Trend/Momentum (OPT)
+# ============================================================
+def tm_candidates(last):
+    # side filter + squeeze
+    if TM_REQUIRE_SQUEEZE and not squeeze_ok(last, TM_MAX_BB_WIDTH, TM_MAX_ATR_PCT):
+        return []
+
+    # basic sanity
+    req = ["ema9","ema21","ema50","ema200","rsi","adx","macd_line","macd_signal","macd_hist","vol_sma20","cmf"]
+    if any(pd.isna(last.get(k)) for k in req):
+        return []
+
+    candidates = []
+
+    # LONG
+    if SIDE_FILTER in ("ALL", "LONG"):
+        if (
+            last["ema21"] > last["ema50"] * 0.995
+            and last["ema9"] > last["ema21"] * 0.995
+            and TM_RSI_LONG_MIN <= last["rsi"] <= TM_RSI_LONG_MAX
+            and last["adx"] >= max(MIN_ADX, 18)          # trend daha güçlü olsun
+            and last["macd_hist"] > 0                    # histogram pozitif
+            and last["macd_line"] > last["macd_signal"]  # momentum
+            and last["volume"] >= TM_VOL_MIN_RATIO * (last["vol_sma20"] or 1)
+            and last["cmf"] >= TM_CMF_LONG_MIN
+        ):
+            candidates.append("LONG")
+
+    # SHORT
+    if SIDE_FILTER in ("ALL", "SHORT"):
+        if (
+            last["ema21"] < last["ema50"] * 1.005
+            and last["ema9"] < last["ema21"] * 1.005
+            and TM_RSI_SHORT_MIN <= last["rsi"] <= TM_RSI_SHORT_MAX
+            and last["adx"] >= max(MIN_ADX, 18)
+            and last["macd_hist"] < 0
+            and last["macd_line"] < last["macd_signal"]
+            and last["volume"] >= TM_VOL_MIN_RATIO * (last["vol_sma20"] or 1)
+            and last["cmf"] <= TM_CMF_SHORT_MAX
+        ):
+            candidates.append("SHORT")
+
+    return candidates
+
+
+def tm_score(last, side):
+    score = 0
+    badges = []
+
+    # regime alignment
+    if side == "LONG" and last["ema50"] > last["ema200"]:
+        score += 3; badges.append("⭐ TrendUp(50>200)")
+    if side == "SHORT" and last["ema50"] < last["ema200"]:
+        score += 3; badges.append("⭐ TrendDn(50<200)")
+
+    # squeeze bonus
+    if squeeze_ok(last, TM_MAX_BB_WIDTH, TM_MAX_ATR_PCT):
+        score += 2; badges.append("⭐ Squeeze")
+
+    # OBV direction
+    if side == "LONG" and last["obv_slope"] > 0:
+        score += 2; badges.append("⭐ OBV↑")
+    if side == "SHORT" and last["obv_slope"] < 0:
+        score += 2; badges.append("⭐ OBV↓")
+
+    # ADX strength
+    if last["adx"] >= 25:
+        score += 2; badges.append("• ADX25+")
+    elif last["adx"] >= 20:
+        score += 1; badges.append("• ADX20+")
+
+    # Volume spike
+    if last["volume"] > (last["vol_sma20"] or 1) * 1.3:
+        score += 1; badges.append("• VolSpike")
+
+    # CMF direction
+    if side == "LONG" and last["cmf"] > 0:
+        score += 1; badges.append("• CMF+")
+    if side == "SHORT" and last["cmf"] < 0:
+        score += 1; badges.append("• CMF-")
+
+    return score, ", ".join(badges)
+
+
+# ============================================================
+# 6) Strategy B: Breakout + Retest
+# ============================================================
+def br_candidates(last):
+    if BR_REQUIRE_SQUEEZE and not squeeze_ok(last, BR_MAX_BB_WIDTH, BR_MAX_ATR_PCT):
+        return []
+
+    req = ["close","high","low","hh","ll","atr14","adx","vol_sma20","volume","cmf","macd_hist"]
+    if any(pd.isna(last.get(k)) for k in req):
+        return []
+
+    atr = float(last["atr14"]) if last["atr14"] and last["atr14"] > 0 else None
+    if atr is None:
+        return []
+
+    tol = BR_RETEST_ATR * atr  # retest tolerance
+
+    candidates = []
+
+    # LONG breakout+retest:
+    # - breakout happened recently is hard to detect w/o prev bar states; we approximate:
+    #   close >= hh (breakout) OR close is near hh (retest zone) AND candle holds above hh - tol
+    if SIDE_FILTER in ("ALL", "LONG"):
+        level = float(last["hh"])
+        close = float(last["close"])
+        low = float(last["low"])
+        # retest: price came near level and held
+        retest_ok = (abs(close - level) <= tol) or (low <= level + tol and close >= level - tol)
+        hold_ok = close >= level - tol
+        vol_ok = last["volume"] >= 0.9 * (last["vol_sma20"] or 1)
+        if retest_ok and hold_ok and vol_ok and last["macd_hist"] >= 0:
+            candidates.append("LONG")
+
+    # SHORT breakout+retest:
+    if SIDE_FILTER in ("ALL", "SHORT"):
+        level = float(last["ll"])
+        close = float(last["close"])
+        high = float(last["high"])
+        retest_ok = (abs(close - level) <= tol) or (high >= level - tol and close <= level + tol)
+        hold_ok = close <= level + tol
+        vol_ok = last["volume"] >= 0.9 * (last["vol_sma20"] or 1)
+        if retest_ok and hold_ok and vol_ok and last["macd_hist"] <= 0:
+            candidates.append("SHORT")
+
+    return candidates
+
+
+def br_score(last, side):
+    score = 0
+    badges = []
+
+    # squeeze is mandatory/bonus
+    if squeeze_ok(last, BR_MAX_BB_WIDTH, BR_MAX_ATR_PCT):
+        score += 3; badges.append("⭐ Squeeze")
+
+    # ADX should not be too low (avoid dead markets)
+    if last["adx"] >= 20:
+        score += 2; badges.append("⭐ ADX20+")
+    elif last["adx"] >= 15:
+        score += 1; badges.append("• ADX15+")
+
+    # trend alignment helps
+    if side == "LONG" and last["ema50"] > last["ema200"]:
+        score += 1; badges.append("• BiasUp")
+    if side == "SHORT" and last["ema50"] < last["ema200"]:
+        score += 1; badges.append("• BiasDn")
+
+    # volume
+    if last["volume"] > (last["vol_sma20"] or 1) * 1.2:
+        score += 2; badges.append("⭐ VolPush")
+    elif last["volume"] >= 0.9 * (last["vol_sma20"] or 1):
+        score += 1; badges.append("• VolOK")
+
+    # CMF confirmation
+    if side == "LONG" and last["cmf"] > 0:
+        score += 1; badges.append("• CMF+")
+    if side == "SHORT" and last["cmf"] < 0:
+        score += 1; badges.append("• CMF-")
+
+    return score, ", ".join(badges)
+
+
+# ============================================================
+# 7) HTML (two tables)
 # ============================================================
 def color_rr(v):
     if v is None:
         return ""
-    if v >= 1.5:
+    if v >= 1.7:
         return "background:#064e3b;"
-    if 1.0 <= v < 1.5:
+    if 1.2 <= v < 1.7:
         return "background:#78350f;"
     return "background:#7f1d1d;"
 
 
-def generate_html(rows, output_path, title, meta_text):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    h = [
-        "<html><head><meta charset='UTF-8'>",
-        f"<title>{title}</title>",
-        "<style>",
-        "body{background:#020617;color:#e5e7eb;font-family:Arial;padding:20px;}",
-        "table{width:100%;border-collapse:collapse;margin-top:20px;}",
-        "th{background:#111827;padding:6px;font-size:12px;text-align:right;}",
-        "td{padding:6px;font-size:12px;text-align:right;}",
-        "tr:nth-child(even){background:#0f172a;}",
-        "tr:nth-child(odd){background:#1f2937;}",
-        ".sym{text-align:left;font-weight:bold;}",
-        ".side{text-align:center;font-weight:bold;}",
-        "</style></head><body>",
-        f"<h1 style='text-align:center;color:#facc15;'>{title}</h1>",
-        f"<div style='text-align:center;color:#94a3b8;'>{meta_text}</div>",
-        "<table><tr>",
-        "<th style='text-align:left'>Symbol</th><th>Side</th><th>Score</th><th>Last</th>",
-        "<th>Entry</th><th>Stop</th><th>TP</th><th>Stop%</th><th>TP%</th><th>R/R</th>",
-        "<th>RSI</th><th>ADX</th><th>ATR%</th><th>Vol xAvg</th><th>CMF</th><th style='text-align:left'>Badges</th>",
-        "</tr>"
-    ]
-
-    def fmt(x, d=4):
-        if x is None:
+def fmt_num(x, d=4):
+    if x is None:
+        return "-"
+    try:
+        if isinstance(x, float) and math.isnan(x):
             return "-"
-        try:
-            if isinstance(x, float) and math.isnan(x):
-                return "-"
-        except Exception:
-            pass
-        return f"{x:.{d}f}"
+    except Exception:
+        pass
+    return f"{x:.{d}f}"
+
+
+def render_table(rows, table_title):
+    h = []
+    h.append(f"<h2 style='margin-top:26px;color:#e2e8f0;'>{table_title} <span style='color:#94a3b8;font-size:12px;'>(rows={len(rows)})</span></h2>")
+    h.append("<table><tr>")
+    h.append("<th style='text-align:left'>Symbol</th><th>Side</th><th>Score</th><th>Last</th>")
+    h.append("<th>Entry</th><th>Stop</th><th>TP</th><th>Stop%</th><th>TP%</th><th>R/R</th>")
+    h.append("<th>RSI</th><th>ADX</th><th>ATR%</th><th>Vol xAvg</th><th>CMF</th><th style='text-align:left'>Badges</th>")
+    h.append("</tr>")
 
     for r in rows:
         rr_style = color_rr(r["rr"])
@@ -335,23 +443,53 @@ def generate_html(rows, output_path, title, meta_text):
             f"<td class='sym'>{r['symbol']}</td>"
             f"<td class='side'>{r['side']}</td>"
             f"<td>{r['score']}</td>"
-            f"<td>{fmt(r['close'])}</td>"
-            f"<td>{fmt(r['entry'])}</td>"
-            f"<td>{fmt(r['stop'])}</td>"
-            f"<td>{fmt(r['tp'])}</td>"
-            f"<td>{fmt(r['stop_pct'],2)}</td>"
-            f"<td>{fmt(r['tp_pct'],2)}</td>"
-            f"<td style='{rr_style}'>{fmt(r['rr'],2)}</td>"
-            f"<td>{fmt(r['rsi'],2)}</td>"
-            f"<td>{fmt(r['adx'],2)}</td>"
-            f"<td>{fmt(r['atr_pct'],2)}</td>"
-            f"<td>{fmt(r['vol_ratio'],2)}</td>"
-            f"<td>{fmt(r['cmf'],3)}</td>"
+            f"<td>{fmt_num(r['close'])}</td>"
+            f"<td>{fmt_num(r['entry'])}</td>"
+            f"<td>{fmt_num(r['stop'])}</td>"
+            f"<td>{fmt_num(r['tp'])}</td>"
+            f"<td>{fmt_num(r['stop_pct'],2)}</td>"
+            f"<td>{fmt_num(r['tp_pct'],2)}</td>"
+            f"<td style='{rr_style}'>{fmt_num(r['rr'],2)}</td>"
+            f"<td>{fmt_num(r['rsi'],2)}</td>"
+            f"<td>{fmt_num(r['adx'],2)}</td>"
+            f"<td>{fmt_num(r['atr_pct'],2)}</td>"
+            f"<td>{fmt_num(r['vol_ratio'],2)}</td>"
+            f"<td>{fmt_num(r['cmf'],3)}</td>"
             f"<td style='text-align:left'>{r['badges']}</td>"
             "</tr>"
         )
 
-    h.append("</table></body></html>")
+    h.append("</table>")
+    return "\n".join(h)
+
+
+def generate_page(rows_tm, rows_br, output_path, title, meta_top):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    h = [
+        "<html><head><meta charset='UTF-8'>",
+        f"<title>{title}</title>",
+        "<style>",
+        "body{background:#020617;color:#e5e7eb;font-family:Arial;padding:20px;}",
+        "table{width:100%;border-collapse:collapse;margin-top:10px;}",
+        "th{background:#111827;padding:6px;font-size:12px;text-align:right;position:sticky;top:0;}",
+        "td{padding:6px;font-size:12px;text-align:right;}",
+        "tr:nth-child(even){background:#0f172a;}",
+        "tr:nth-child(odd){background:#1f2937;}",
+        ".sym{text-align:left;font-weight:bold;}",
+        ".side{text-align:center;font-weight:bold;}",
+        ".badge{color:#94a3b8;font-size:12px;}",
+        "</style></head><body>",
+        f"<h1 style='text-align:center;color:#facc15;'>{title}</h1>",
+        f"<div style='text-align:center;color:#94a3b8;'>{meta_top}</div>",
+        "<div style='text-align:center;color:#64748b;margin-top:6px;font-size:12px;'>"
+        "Not: Bu çıktılar finansal tavsiye değildir. Kaldıraçta risk yönetimi şarttır.</div>",
+    ]
+
+    h.append(render_table(rows_tm, "1) Trend/Momentum (OPT) – daha seçici sinyaller"))
+    h.append(render_table(rows_br, "2) Breakout + Retest – sıkışma sonrası retest onayı"))
+
+    h.append("</body></html>")
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(h))
@@ -368,44 +506,37 @@ def main():
 
     if not symbols:
         title = "Futures Dashboard (NO DATA - proxy blocked?)"
-        os.makedirs("public", exist_ok=True)
-        meta = f"Güncellendi: {updated_at} | interval={INTERVAL} | only_signal={ONLY_SIGNAL} | side={SIDE_FILTER} | minRR={MIN_RR} | symbols=0 | rows=0"
-        generate_html([], "public/futures_ls.html", title, meta)
-        generate_html([], "public/spot.html", title, meta)
-        print("⚠️ Sembol listesi boş. Boş dashboard basıldı, çıkılıyor.")
+        meta = f"Güncellendi: {updated_at} | interval={INTERVAL} | symbols=0 | TM_rows=0 | BR_rows=0"
+        generate_page([], [], "public/spot.html", title, meta)
+        generate_page([], [], "public/futures_ls.html", title, meta)
+        print("⚠️ Sembol listesi boş. Boş dashboard basıldı.")
         return
 
-    rows = []
+    rows_tm = []
+    rows_br = []
 
     for sym in symbols:
         try:
             df = get_futures_klines(sym, INTERVAL, LIMIT)
-            if df is None or len(df) < 220:
+            if df is None or len(df) < max(220, BR_LOOKBACK + 20):
                 continue
 
             df = compute_indicators(df)
             last = df.iloc[-1]
 
-            is_long = long_condition(last)
-            is_short = short_condition(last)
+            # shared fields
+            vol_ratio = float(last["volume"]) / float((last["vol_sma20"] or 1))
 
-            candidates = []
-            if SIDE_FILTER in ("ALL", "LONG") and is_long:
-                candidates.append("LONG")
-            if SIDE_FILTER in ("ALL", "SHORT") and is_short:
-                candidates.append("SHORT")
-
-            if not ONLY_SIGNAL and not candidates:
-                bias = "LONG" if (last["ema50"] > last["ema200"]) else "SHORT"
-                candidates = [bias]
-
-            for side in candidates:
-                score, badges = compute_score_and_badges(last, side)
+            # ---------- Strategy A: Trend/Momentum OPT ----------
+            cands_tm = tm_candidates(last)
+            for side in cands_tm:
                 entry, stop, tp, stop_pct, tp_pct, rr = calc_levels(last, side)
                 if rr is None or rr < MIN_RR:
                     continue
-
-                rows.append({
+                score, badges = tm_score(last, side)
+                if score < TM_MIN_SCORE:
+                    continue
+                rows_tm.append({
                     "symbol": sym,
                     "side": side,
                     "close": float(last["close"]),
@@ -419,7 +550,35 @@ def main():
                     "rsi": float(last["rsi"]) if not pd.isna(last["rsi"]) else None,
                     "adx": float(last["adx"]) if not pd.isna(last["adx"]) else None,
                     "atr_pct": float(last["atr_pct"]) if not pd.isna(last["atr_pct"]) else None,
-                    "vol_ratio": float(last["volume"]) / float((last["vol_sma20"] or 1)),
+                    "vol_ratio": vol_ratio,
+                    "cmf": float(last["cmf"]) if not pd.isna(last["cmf"]) else None,
+                    "badges": badges
+                })
+
+            # ---------- Strategy B: Breakout+Retest ----------
+            cands_br = br_candidates(last)
+            for side in cands_br:
+                entry, stop, tp, stop_pct, tp_pct, rr = calc_levels(last, side)
+                if rr is None or rr < MIN_RR:
+                    continue
+                score, badges = br_score(last, side)
+                if score < BR_MIN_SCORE:
+                    continue
+                rows_br.append({
+                    "symbol": sym,
+                    "side": side,
+                    "close": float(last["close"]),
+                    "score": int(score),
+                    "entry": entry,
+                    "stop": stop,
+                    "tp": tp,
+                    "stop_pct": stop_pct,
+                    "tp_pct": tp_pct,
+                    "rr": rr,
+                    "rsi": float(last["rsi"]) if not pd.isna(last["rsi"]) else None,
+                    "adx": float(last["adx"]) if not pd.isna(last["adx"]) else None,
+                    "atr_pct": float(last["atr_pct"]) if not pd.isna(last["atr_pct"]) else None,
+                    "vol_ratio": vol_ratio,
                     "cmf": float(last["cmf"]) if not pd.isna(last["cmf"]) else None,
                     "badges": badges
                 })
@@ -428,17 +587,23 @@ def main():
         except Exception:
             continue
 
-    rows_sorted = sorted(rows, key=lambda r: (-r["score"], -(r["rr"] or 0)))
+    # sort & trim
+    rows_tm_sorted = sorted(rows_tm, key=lambda r: (-r["score"], -(r["rr"] or 0)))[:TM_MAX_ROWS]
+    rows_br_sorted = sorted(rows_br, key=lambda r: (-r["score"], -(r["rr"] or 0)))[:BR_MAX_ROWS]
+
+    title = "Binance Futures (USDT-M PERP) – 2 Strateji (Long/Short)"
+    meta = (
+        f"Güncellendi: {updated_at} | interval={INTERVAL} | symbols={total_symbols} "
+        f"| TM_rows={len(rows_tm_sorted)} | BR_rows={len(rows_br_sorted)}"
+    )
 
     os.makedirs("public", exist_ok=True)
-    title = "Binance Futures (USDT-M PERP) – Long/Short Dashboard"
-    meta = (
-        f"Güncellendi: {updated_at} | interval={INTERVAL} | only_signal={ONLY_SIGNAL} | side={SIDE_FILTER} "
-        f"| minRR={MIN_RR} | symbols={total_symbols} | rows={len(rows_sorted)}"
-    )
-    generate_html(rows_sorted, "public/futures_ls.html", title, meta)
-    generate_html(rows_sorted, "public/spot.html", title, meta)  # index/workflow bozulmasın
-    print(f"✅ Dashboard üretildi: rows={len(rows_sorted)}")
+    # tek sayfa: spot.html (index yönlendirmesi bozulmasın)
+    generate_page(rows_tm_sorted, rows_br_sorted, "public/spot.html", title, meta)
+    # istersen ayrıca futures_ls.html de aynı sayfa olsun
+    generate_page(rows_tm_sorted, rows_br_sorted, "public/futures_ls.html", title, meta)
+
+    print(f"✅ Dashboard üretildi: TM_rows={len(rows_tm_sorted)} | BR_rows={len(rows_br_sorted)}")
 
 
 if __name__ == "__main__":
